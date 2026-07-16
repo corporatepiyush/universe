@@ -1,0 +1,32 @@
+# Linux native test image for universe.
+#
+# Purpose: RUN the test suite on real Linux (not just codegen it), on the
+# same LLVM major version as the macOS dev host. Containers share the Docker
+# VM kernel, so this image cannot choose its kernel — it VERIFIES the kernel
+# is >= 6.15 at test time (docker/run-tests.sh) and fails loudly otherwise.
+#
+# Build for the host arch (arm64 on Apple silicon) by default; add
+# `--platform linux/amd64` to exercise x86_64 under emulation.
+
+FROM ubuntu:24.04
+
+ARG LLVM_VERSION=22
+ENV DEBIAN_FRONTEND=noninteractive
+
+# LLVM from apt.llvm.org (matches the dev host's major version).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates wget gnupg lsb-release software-properties-common \
+        make build-essential \
+    && wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh \
+    && chmod +x /tmp/llvm.sh \
+    && /tmp/llvm.sh ${LLVM_VERSION} \
+    && apt-get install -y --no-install-recommends \
+        clang-${LLVM_VERSION} llvm-${LLVM_VERSION} \
+    && rm -rf /var/lib/apt/lists/* /tmp/llvm.sh
+
+ENV LLVM=/usr/lib/llvm-22/bin
+WORKDIR /universe
+
+# Source is bind-mounted at run time (see run-tests.sh) so edits need no
+# rebuild of the image. The build/ dir is kept out of the mount.
+ENTRYPOINT ["/universe/docker/run-tests.sh"]
