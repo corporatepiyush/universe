@@ -81,7 +81,7 @@ clang -O3 mycli.c build/libuniverse.a -lpthread -lm -o mycli
 | [http](http/) | 2 | HTTP/1.1 client+server, io_uring variant |
 | [io](io/) | 1 | buffered readers/writers |
 | [ioring](ioring/) | 1 | io_uring submission/completion (Linux) |
-| [linalg](linalg/) | 1+ | dense linear algebra — SIMD GEMM, factorizations, eigen/SVD |
+| [linalg](linalg/) | 3 | dense linear algebra — SIMD GEMM (`matrix`), LU/QR/Cholesky/solve/det/inv (`factor`), symmetric eigen + SVD (`eigen`) |
 | [llm](llm/) | 1 | OpenAI-style chat/completion client |
 | [ml](ml/) | 9 | SIMD kernels, k-means, kNN, linear/logistic, PCA, HNSW, IVF, quant, rerank |
 | [net](net/) | 2 | TCP sockets, connection pool (constants build-selected per OS) |
