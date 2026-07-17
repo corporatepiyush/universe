@@ -15,6 +15,9 @@
 ; TLSF — Two-Level Segregated Fit allocator: O(1) worst-case alloc & free with
 ; bounded fragmentation. General-purpose (arbitrary sizes, real free & reuse),
 ; unlike arena/pool/buddy which trade generality for a narrower fast path.
+; This is the SDK's DEFAULT/PRIMARY malloc replacement, so it GROWS: when the
+; managed region(s) cannot satisfy a request it mallocs a NEW backing region,
+; links it in, and serves from it — the cold fallback; the common path is O(1).
 ;
 ; DESIGN (from first principles; not ported from any source):
 ;   * SEGREGATED FREE LISTS indexed by a two-level key. First level FL =
@@ -32,37 +35,57 @@
 ;     is inspected for BLOCK_FREE and the PREV_FREE bit tells us the previous
 ;     physical block is free (reached via PREV_PHYS) — merge either/both in O(1)
 ;     and keep the "no two adjacent free blocks" invariant.
-;   * ONE region: the control block (FL/SL bitmaps + head table + bookkeeping)
-;     is carved from the FRONT of the caller's region; the remainder is the
-;     managed pool. If base==null we malloc(size) ourselves (the allocator IMPL
-;     — the one legitimate malloc) and free it on destroy; a caller region is
-;     never freed.
+;   * MULTI-REGION GROWTH (the malloc-replacement enabler):
+;       - The control block (FL/SL bitmaps + head table + bookkeeping) lives once
+;         at the FRONT of the FIRST region; all regions share it. Every region
+;         (region 0 and each grown region) reserves a used SENTINEL block header
+;         at its very end and starts its pool with a single free block. The first
+;         block of a region has prev_phys=null and PREV_FREE=0; the trailing
+;         sentinel is a zero-size USED block. Together these BOUND coalescing to
+;         WITHIN a region: mergeprev stops at the null-prev first block, mergenext
+;         stops at the used sentinel. Because a sentinel always follows the last
+;         real block, the "next physical block" is ALWAYS a valid header — no
+;         pool_end comparison is needed on the hot path (removed).
+;       - GROWTH is AUTOMATIC when the allocator OWNS its memory (created with
+;         base==null => owns_memory=1). On an alloc that find() cannot satisfy,
+;         grow() mallocs a region of size max(need+overhead, current_total,
+;         1 MiB floor) capped at 2^36, carves a 16B RegionHeader {next, base} at
+;         its front, links it into the region list, seeds its pool, and the alloc
+;         retries find(). A CALLER-SUPPLIED region (base!=null => owns_memory=0)
+;         is FIXED and NEVER grows: alloc returns null on exhaustion, exactly as
+;         before. (A caller wanting a growable heap passes base==null.)
 ;   * Block header (16B, payload 16-aligned at +16):
-;       +0  ptr prev_phys      (null for the first pool block)
+;       +0  ptr prev_phys      (null for the first block of a region)
 ;       +8  i64 size_and_flags (total block size incl header | flags)
 ;     free blocks additionally use payload words:
 ;       +16 ptr next_free      (null sentinel)
 ;       +24 ptr prev_free
-;     min block = 32B (header + two link words).
+;     min block = 32B (header + two link words). Sentinel = 16B used block.
 ;   * Control block layout (offsets, size 4288 = CONTROL_SIZE):
 ;       +0   i64 fl_bitmap
 ;       +8   i64 live               (sum of block payload bytes of live blocks)
-;       +16  ptr pool_end
-;       +24  i64 owns_memory        (1 => we malloc'd base; free on destroy)
-;       +32  ptr pool_start
-;       +40  ptr base               (== handle; the malloc ptr when owned)
+;       +16  i64 reserved           (was pool_end; unused since sentinels)
+;       +24  i64 owns_memory        (1 => region 0 malloc'd + growable)
+;       +32  ptr pool_start         (region 0's first pool block)
+;       +40  ptr base               (== handle; region 0's malloc ptr when owned)
+;       +48  ptr region_head        (list of grown RegionHeaders, null-terminated)
+;       +56  i64 total_size         (sum of all region byte sizes; geometric grow)
 ;       +64  i32 sl_bitmap[32]      (128B, ends +192)
 ;       +192 ptr heads[512]         (32*16 pointers, 4096B, ends +4288)
+;   * RegionHeader (grown regions only, 16B at region front):
+;       +0   ptr next   (next RegionHeader or null)
+;       +8   ptr base   (== the malloc ptr, freed on destroy)
 ;   * _live returns the summed block-PAYLOAD bytes (block_size-16) of the
-;     currently-live allocations — deterministic, so a test records the per-alloc
-;     delta and checks free subtracts exactly that.
+;     currently-live allocations across ALL regions — deterministic.
+;   * destroy walks region_head freeing every grown region, then frees region 0
+;     iff owns_memory==1; a caller-supplied region 0 is never freed.
 ;
 ; ORDERINGS: single-threaded structure; no atomics (a concurrent TLSF would need
 ;   a striped or lock-guarded front — out of scope here).
 ;
 ; API (C ABI, nounwind):
 ;   ptr  universe_alloc_tlsf_create(ptr base, i64 size)  ; null on bad size/OOM
-;   ptr  universe_alloc_tlsf_alloc(ptr h, i64 size)      ; 16-aligned; null=full
+;   ptr  universe_alloc_tlsf_alloc(ptr h, i64 size)      ; 16-aligned; grows if owned
 ;   ptr  universe_alloc_tlsf_alloc_aligned(ptr h, i64 size, i64 align) ; align=pow2
 ;   void universe_alloc_tlsf_free(ptr h, ptr p)
 ;   i64  universe_alloc_tlsf_live(ptr h)
@@ -273,17 +296,129 @@ retnull:
   ret ptr null
 }
 
+; ---- pool seeding (region setup) -----------------------------------------
+
+; seed a pool [pstart, pstart+psize) with ONE free block + a trailing used
+; sentinel, and insert the free block. psize must be a multiple of 16, >=48,
+; pstart 16-aligned. The sentinel bounds coalescing at the region's high edge.
+define internal void @seed_pool(ptr %h, ptr %pstart, i64 %psize) #0 {
+entry:
+  %freesize = sub i64 %psize, 16
+  store ptr null, ptr %pstart, align 8            ; free.prev_phys = null (region low edge)
+  %fsp = getelementptr inbounds nuw i8, ptr %pstart, i64 8
+  %fsf = or i64 %freesize, 1                        ; free, PREV_FREE=0
+  store i64 %fsf, ptr %fsp, align 8
+  %sent = getelementptr inbounds nuw i8, ptr %pstart, i64 %freesize
+  store ptr %pstart, ptr %sent, align 8            ; sentinel.prev_phys = free block
+  %ssp = getelementptr inbounds nuw i8, ptr %sent, i64 8
+  store i64 2, ptr %ssp, align 8                    ; size 0, USED (bit0=0), PREV_FREE=1
+  call void @ins(ptr %h, ptr %pstart, i64 %freesize)
+  ret void
+}
+
+; ---- growth: malloc a new region and seed it (COLD fallback) -------------
+
+; If the allocator owns its memory, malloc a fresh region big enough for `need`
+; (a total block size), link it, and seed its pool. Returns the region ptr, or
+; null if not growable / OOM / need too large. Cold; not on the alloc fast path.
+define internal ptr @grow(ptr %h, i64 %need) #1 {
+entry:
+  %ownsp = getelementptr inbounds nuw i8, ptr %h, i64 24
+  %owns = load i64, ptr %ownsp, align 8
+  %growable = icmp eq i64 %owns, 1
+  br i1 %growable, label %cont, label %retnull
+
+cont:
+  ; TLSF is a GOOD-fit: find() rounds the request UP to the next SL subclass
+  ; boundary and only accepts a block whose class lower-bound >= that. So the
+  ; seeded free block must be >= that rounded value, else a block barely larger
+  ; than `need` lands in a LOWER subclass and find() misses it. Round `need` the
+  ; same way find() does before sizing.
+  %fb = call i64 @fls(i64 %need)
+  %rsh = sub i64 %fb, 4
+  %oneR = shl i64 1, %rsh
+  %rup = add i64 %oneR, -1
+  %needR = add i64 %need, %rup
+  ; overhead = RegionHeader(16) + sentinel(16) + align slack(16) = 48
+  %o1 = call { i64, i1 } @llvm.uadd.with.overflow.i64(i64 %needR, i64 48)
+  %need48 = extractvalue { i64, i1 } %o1, 0
+  %ov1 = extractvalue { i64, i1 } %o1, 1
+  %toobig = icmp ugt i64 %need48, 68719476736       ; keep seeded block < 2^36
+  %bad = or i1 %ov1, %toobig
+  br i1 %bad, label %retnull, label %size
+
+size:
+  %totp = getelementptr inbounds nuw i8, ptr %h, i64 56
+  %tot = load i64, ptr %totp, align 8
+  %w1 = call i64 @llvm.umax.i64(i64 %need48, i64 %tot)      ; geometric: ~current total
+  %w2 = call i64 @llvm.umax.i64(i64 %w1, i64 1048576)       ; 1 MiB floor
+  %rsize = call i64 @llvm.umin.i64(i64 %w2, i64 68719476736) ; cap 2^36
+  %m = call ptr @malloc(i64 %rsize)
+  %mnull = icmp eq ptr %m, null
+  br i1 %mnull, label %retnull, label %setup
+
+setup:
+  ; RegionHeader at m front: +0 next (old head), +8 base (== m)
+  %rhp = getelementptr inbounds nuw i8, ptr %h, i64 48
+  %oldhead = load ptr, ptr %rhp, align 8
+  store ptr %oldhead, ptr %m, align 8               ; region.next = old head
+  %rbasep = getelementptr inbounds nuw i8, ptr %m, i64 8
+  store ptr %m, ptr %rbasep, align 8                ; region.base = m
+  store ptr %m, ptr %rhp, align 8                   ; region_head = m
+  %totn = add i64 %tot, %rsize
+  store i64 %totn, ptr %totp, align 8
+  ; pool start = align_up(m + 16, 16)
+  %mi = ptrtoint ptr %m to i64
+  %he = add i64 %mi, 16
+  %he15 = add i64 %he, 15
+  %heal = and i64 %he15, -16
+  %delta = sub i64 %heal, %mi
+  %pstart = getelementptr inbounds nuw i8, ptr %m, i64 %delta
+  %pbytes = sub i64 %rsize, %delta
+  %psize = and i64 %pbytes, -16
+  call void @seed_pool(ptr %h, ptr %pstart, i64 %psize)
+  ret ptr %m
+
+retnull:
+  ret ptr null
+}
+
+; find a block for `need`; on miss, grow once and retry. Returns null only when
+; the allocator is fixed (caller region) & full, or growth failed.
+define internal ptr @find_or_grow(ptr %h, i64 %need) #1 {
+entry:
+  %b1 = call ptr @find(ptr %h, i64 %need)
+  %ok1 = icmp ne ptr %b1, null
+  br i1 %ok1, label %ret, label %trygrow, !prof !1
+
+trygrow:
+  %g = call ptr @grow(ptr %h, i64 %need)
+  %gok = icmp ne ptr %g, null
+  br i1 %gok, label %research, label %ret2
+
+research:
+  %b2 = call ptr @find(ptr %h, i64 %need)
+  br label %ret
+
+ret:
+  %blk = phi ptr [ %b1, %entry ], [ %b2, %research ]
+  ret ptr %blk
+
+ret2:
+  ret ptr null
+}
+
 ; ---- place a removed block: split trailing remainder, account, return payload
 
 ; `blk` has been removed from its free list. `bsize` is its total size, `need`
 ; the requested total, `prevfree` the PREV_FREE bit to preserve on blk. Returns
-; the user payload pointer (blk+16).
+; the user payload pointer (blk+16). The next physical block always exists (a
+; real block or the region sentinel), so its back-links are always updated.
 define internal ptr @place(ptr %h, ptr %blk, i64 %bsize, i64 %need, i64 %prevfree) #0 {
 entry:
   %rem = sub i64 %bsize, %need
   %dosplit = icmp uge i64 %rem, 32
   %sfp = getelementptr inbounds nuw i8, ptr %blk, i64 8
-  %pendp = getelementptr inbounds nuw i8, ptr %h, i64 16
   br i1 %dosplit, label %split, label %whole
 
 split:
@@ -296,36 +431,26 @@ split:
   store i64 %rsf, ptr %rsfp, align 8
   call void @ins(ptr %h, ptr %r, i64 %rem)
   %nb = getelementptr inbounds nuw i8, ptr %blk, i64 %bsize
-  %pendS = load ptr, ptr %pendp, align 8
-  %inS = icmp ult ptr %nb, %pendS
-  br i1 %inS, label %split.fix, label %finish
-
-split.fix:
   store ptr %r, ptr %nb, align 8                 ; nb.prev_phys = r
-  %nbsfpS = getelementptr inbounds nuw i8, ptr %nb, i64 8
-  %nbsfS = load i64, ptr %nbsfpS, align 8
-  %nbsfS2 = or i64 %nbsfS, 2                       ; r is free -> PREV_FREE
-  store i64 %nbsfS2, ptr %nbsfpS, align 8
+  %nbsfp = getelementptr inbounds nuw i8, ptr %nb, i64 8
+  %nbsf = load i64, ptr %nbsfp, align 8
+  %nbsf2 = or i64 %nbsf, 2                         ; r is free -> PREV_FREE
+  store i64 %nbsf2, ptr %nbsfp, align 8
   br label %finish
 
 whole:
   %sf2 = or i64 %bsize, %prevfree
   store i64 %sf2, ptr %sfp, align 8              ; blk used, whole block
   %nbw = getelementptr inbounds nuw i8, ptr %blk, i64 %bsize
-  %pendW = load ptr, ptr %pendp, align 8
-  %inW = icmp ult ptr %nbw, %pendW
-  br i1 %inW, label %whole.fix, label %finish
-
-whole.fix:
-  store ptr %blk, ptr %nbw, align 8              ; nb.prev_phys = blk
-  %nbsfpW = getelementptr inbounds nuw i8, ptr %nbw, i64 8
-  %nbsfW = load i64, ptr %nbsfpW, align 8
-  %clr = and i64 %nbsfW, -3                        ; blk used -> clear PREV_FREE
-  store i64 %clr, ptr %nbsfpW, align 8
+  store ptr %blk, ptr %nbw, align 8             ; nb.prev_phys = blk
+  %nbwsfp = getelementptr inbounds nuw i8, ptr %nbw, i64 8
+  %nbwsf = load i64, ptr %nbwsfp, align 8
+  %clr = and i64 %nbwsf, -3                        ; blk used -> clear PREV_FREE
+  store i64 %clr, ptr %nbwsfp, align 8
   br label %finish
 
 finish:
-  %used = phi i64 [ %need, %split ], [ %need, %split.fix ], [ %bsize, %whole ], [ %bsize, %whole.fix ]
+  %used = phi i64 [ %need, %split ], [ %bsize, %whole ]
   %livep = getelementptr inbounds nuw i8, ptr %h, i64 8
   %live = load i64, ptr %livep, align 8
   %pay = sub i64 %used, 16
@@ -339,7 +464,7 @@ finish:
 
 define noalias ptr @universe_alloc_tlsf_create(ptr %base, i64 %size) local_unnamed_addr #1 {
 entry:
-  %toosmall = icmp ult i64 %size, 4320             ; need control(4288) + one min(32)
+  %toosmall = icmp ult i64 %size, 4336             ; control(4288) + sentinel(16) + min(32)
   %toobig = icmp ugt i64 %size, 68719476736        ; 2^36 cap keeps FL index < 32
   %bad = or i1 %toosmall, %toobig
   br i1 %bad, label %fail, label %ownck, !prof !0
@@ -369,25 +494,19 @@ setup:
   %endi = add i64 %regi, %size
   %psize.raw = sub i64 %endi, %ceal
   %psize = and i64 %psize.raw, -16
-  %psmall = icmp ult i64 %psize, 32
+  %psmall = icmp ult i64 %psize, 48                ; need sentinel(16) + min free(32)
   br i1 %psmall, label %failfree, label %build, !prof !0
 
 build:
-  %pend = getelementptr inbounds nuw i8, ptr %pstart, i64 %psize
-  %pendp = getelementptr inbounds nuw i8, ptr %reg, i64 16
-  store ptr %pend, ptr %pendp, align 8
   %ownsp = getelementptr inbounds nuw i8, ptr %reg, i64 24
   store i64 %owns, ptr %ownsp, align 8
   %pstartp = getelementptr inbounds nuw i8, ptr %reg, i64 32
   store ptr %pstart, ptr %pstartp, align 8
   %basep = getelementptr inbounds nuw i8, ptr %reg, i64 40
   store ptr %reg, ptr %basep, align 8
-  ; initial free block: whole pool
-  store ptr null, ptr %pstart, align 8            ; prev_phys = null
-  %isfp = getelementptr inbounds nuw i8, ptr %pstart, i64 8
-  %isf = or i64 %psize, 1                          ; free, PREV_FREE=0
-  store i64 %isf, ptr %isfp, align 8
-  call void @ins(ptr %reg, ptr %pstart, i64 %psize)
+  %totp = getelementptr inbounds nuw i8, ptr %reg, i64 56
+  store i64 %size, ptr %totp, align 8              ; region_head @+48 stays null (memset)
+  call void @seed_pool(ptr %reg, ptr %pstart, i64 %psize)
   ret ptr %reg
 
 failfree:
@@ -420,7 +539,7 @@ need:
   br i1 %ovf, label %fail, label %search, !prof !0
 
 search:
-  %blk = call ptr @find(ptr %h, i64 %needf)
+  %blk = call ptr @find_or_grow(ptr %h, i64 %needf)
   %bnull = icmp eq ptr %blk, null
   br i1 %bnull, label %fail, label %take, !prof !0
 
@@ -468,7 +587,7 @@ big:
   br i1 %ovf, label %fail, label %search, !prof !0
 
 search:
-  %blk = call ptr @find(ptr %h, i64 %srch)
+  %blk = call ptr @find_or_grow(ptr %h, i64 %srch)
   %bnull = icmp eq ptr %blk, null
   br i1 %bnull, label %fail, label %take, !prof !0
 
@@ -535,17 +654,12 @@ work:
   %pay = sub i64 %bsize0, 16
   %liven = sub i64 %live, %pay
   store i64 %liven, ptr %livep, align 8
-  %pendp = getelementptr inbounds nuw i8, ptr %h, i64 16
-  %pend = load ptr, ptr %pendp, align 8
+  ; next physical block always exists (real block or region sentinel)
   %nb = getelementptr inbounds nuw i8, ptr %blk, i64 %bsize0
-  %nbin = icmp ult ptr %nb, %pend
-  br i1 %nbin, label %cknext, label %afternext
-
-cknext:
   %nbsfp = getelementptr inbounds nuw i8, ptr %nb, i64 8
   %nbsf = load i64, ptr %nbsfp, align 8
   %nbfree = and i64 %nbsf, 1
-  %isfree = icmp ne i64 %nbfree, 0
+  %isfree = icmp ne i64 %nbfree, 0                  ; sentinel is used -> no cross-region merge
   br i1 %isfree, label %mergenext, label %afternext
 
 mergenext:
@@ -555,12 +669,12 @@ mergenext:
   br label %afternext
 
 afternext:
-  %bsize1 = phi i64 [ %bsize0, %work ], [ %bsize0, %cknext ], [ %bsizeM, %mergenext ]
+  %bsize1 = phi i64 [ %bsize0, %work ], [ %bsizeM, %mergenext ]
   %prevfreeb = icmp ne i64 %prevfree, 0
   br i1 %prevfreeb, label %mergeprev, label %afterprev
 
 mergeprev:
-  %pb = load ptr, ptr %blk, align 8               ; prev_phys
+  %pb = load ptr, ptr %blk, align 8               ; prev_phys (null for region's first block)
   call void @rem(ptr %h, ptr %pb)
   %pbsfp = getelementptr inbounds nuw i8, ptr %pb, i64 8
   %pbsf = load i64, ptr %pbsfp, align 8
@@ -578,12 +692,8 @@ afterprev:
   %fin = or i64 %fin0, %pf
   store i64 %fin, ptr %sfpF, align 8
   call void @ins(ptr %h, ptr %blkF, i64 %bsizeF)
+  ; next physical block always exists (real block or region sentinel)
   %nb2 = getelementptr inbounds nuw i8, ptr %blkF, i64 %bsizeF
-  %pend2 = load ptr, ptr %pendp, align 8
-  %nb2in = icmp ult ptr %nb2, %pend2
-  br i1 %nb2in, label %fixnext, label %done
-
-fixnext:
   store ptr %blkF, ptr %nb2, align 8              ; nb2.prev_phys = blkF
   %nb2sfp = getelementptr inbounds nuw i8, ptr %nb2, i64 8
   %nb2sf = load i64, ptr %nb2sfp, align 8
@@ -612,18 +722,36 @@ retz:
 define void @universe_alloc_tlsf_destroy(ptr %h) local_unnamed_addr #1 {
 entry:
   %hnull = icmp eq ptr %h, null
-  br i1 %hnull, label %done, label %work, !prof !0
+  br i1 %hnull, label %done, label %freelist, !prof !0
 
-work:
+freelist:
+  ; walk grown regions, freeing each (RegionHeader is at the region front == base)
+  %rhp = getelementptr inbounds nuw i8, ptr %h, i64 48
+  %head0 = load ptr, ptr %rhp, align 8
+  br label %loop
+
+loop:
+  %rh = phi ptr [ %head0, %freelist ], [ %next, %freenode ]
+  %rhnull = icmp eq ptr %rh, null
+  br i1 %rhnull, label %region0, label %freenode
+
+freenode:
+  %next = load ptr, ptr %rh, align 8               ; next BEFORE freeing (base == rh)
+  %basep = getelementptr inbounds nuw i8, ptr %rh, i64 8
+  %rbase = load ptr, ptr %basep, align 8
+  call void @free(ptr %rbase)
+  br label %loop
+
+region0:
   %ownsp = getelementptr inbounds nuw i8, ptr %h, i64 24
   %owns = load i64, ptr %ownsp, align 8
   %isowns = icmp eq i64 %owns, 1
   br i1 %isowns, label %dofree, label %done
 
 dofree:
-  %basep = getelementptr inbounds nuw i8, ptr %h, i64 40
-  %base = load ptr, ptr %basep, align 8
-  call void @free(ptr %base)
+  %r0p = getelementptr inbounds nuw i8, ptr %h, i64 40
+  %r0 = load ptr, ptr %r0p, align 8
+  call void @free(ptr %r0)
   br label %done
 
 done:
@@ -636,3 +764,4 @@ attributes #2 = { nounwind willreturn norecurse nosync memory(argmem: read) }
 attributes #3 = { alwaysinline nounwind willreturn norecurse nosync memory(none) }
 
 !0 = !{!"branch_weights", i32 1, i32 2000}
+!1 = !{!"branch_weights", i32 2000, i32 1}
