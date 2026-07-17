@@ -47,7 +47,11 @@
 ;         real block, the "next physical block" is ALWAYS a valid header — no
 ;         pool_end comparison is needed on the hot path (removed).
 ;       - GROWTH is AUTOMATIC when the allocator OWNS its memory (created with
-;         base==null => owns_memory=1). On an alloc that find() cannot satisfy,
+;         base==null => owns_memory=1). The OWNED initial region we malloc is
+;         floored at ALLOC_OS_MIN=16384 (16 KiB) — os_size = max(size, 16384) —
+;         so a tiny owned create still obtains a >= 16 KiB backing region; a
+;         caller-supplied region (base!=null) is EXEMPT (the caller sizes it).
+;         On an alloc that find() cannot satisfy,
 ;         grow() mallocs a region of size max(need+overhead, current_total,
 ;         1 MiB floor) capped at 2^36, carves a 16B RegionHeader {next, base} at
 ;         its front, links it into the region list, seeds its pool, and the alloc
@@ -474,7 +478,12 @@ ownck:
   br i1 %ownsb, label %domalloc, label %haveregion
 
 domalloc:
-  %m = call ptr @malloc(i64 %size)
+  ; OS-request floor: an OWNED initial region we malloc is at least ALLOC_OS_MIN
+  ; (16 KiB). A caller-supplied region (haveregion) is EXEMPT — the caller sizes
+  ; it. The validated request (%size >= 4336) is raised, never lowered, so the
+  ; toosmall/toobig guards above still hold and no wrap is possible.
+  %ossize = call i64 @llvm.umax.i64(i64 %size, i64 16384)
+  %m = call ptr @malloc(i64 %ossize)
   %mnull = icmp eq ptr %m, null
   br i1 %mnull, label %fail, label %setup, !prof !0
 
@@ -484,6 +493,7 @@ haveregion:
 setup:
   %reg = phi ptr [ %m, %domalloc ], [ %base, %haveregion ]
   %owns = phi i64 [ 1, %domalloc ], [ 0, %haveregion ]
+  %effsize = phi i64 [ %ossize, %domalloc ], [ %size, %haveregion ]
   call void @llvm.memset.p0.i64(ptr %reg, i8 0, i64 4288, i1 false)
   %regi = ptrtoint ptr %reg to i64
   %ce = add i64 %regi, 4288
@@ -491,7 +501,7 @@ setup:
   %ceal = and i64 %ce15, -16
   %delta = sub i64 %ceal, %regi
   %pstart = getelementptr inbounds nuw i8, ptr %reg, i64 %delta
-  %endi = add i64 %regi, %size
+  %endi = add i64 %regi, %effsize
   %psize.raw = sub i64 %endi, %ceal
   %psize = and i64 %psize.raw, -16
   %psmall = icmp ult i64 %psize, 48                ; need sentinel(16) + min free(32)
@@ -505,7 +515,7 @@ build:
   %basep = getelementptr inbounds nuw i8, ptr %reg, i64 40
   store ptr %reg, ptr %basep, align 8
   %totp = getelementptr inbounds nuw i8, ptr %reg, i64 56
-  store i64 %size, ptr %totp, align 8              ; region_head @+48 stays null (memset)
+  store i64 %effsize, ptr %totp, align 8           ; region_head @+48 stays null (memset)
   call void @seed_pool(ptr %reg, ptr %pstart, i64 %psize)
   ret ptr %reg
 
