@@ -9,6 +9,9 @@ build/
 docs/
 CLAUDE.md
 
+# Claude Code harness working dir (agent worktrees, local settings) — never committed
+.claude/
+
 # OS / editor cruft
 .DS_Store
 *.swp
