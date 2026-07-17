@@ -28,6 +28,10 @@
 ;   * Header: { atomic i64 used @0, i64 capacity @8 }, payload at +128 —
 ;     the RMW-hot line never false-shares with user data (128B covers
 ;     Apple-silicon L2 line pairs).
+;   * OS-request floor: the ONE backing malloc requests at least ALLOC_OS_MIN
+;     (16384 B); usable capacity() is the floored request minus the 128B header
+;     (a tiny requested capacity still backs >= 16256 usable bytes), per the
+;     allocation policy.
 ;   * reset() is documented QUIESCENT-ONLY (no concurrent allocs), matching
 ;     the C contract.
 ;
@@ -53,14 +57,19 @@ entry:
   br i1 %ovf, label %fail, label %alloc, !prof !0
 
 alloc:
-  %mem = call ptr @malloc(i64 %total)
+  ; OS-request floor: never malloc less than ALLOC_OS_MIN (16384) for backing
+  ; memory we sub-allocate. umax cannot overflow; usable capacity is the floored
+  ; request minus the 128B header (floored >= 16384 >= 128, so a plain sub).
+  %os.req = call i64 @llvm.umax.i64(i64 %total, i64 16384)
+  %mem = call ptr @malloc(i64 %os.req)
   %mem.null = icmp eq ptr %mem, null
   br i1 %mem.null, label %fail, label %init, !prof !0
 
 init:
+  %usable = sub i64 %os.req, 128
   store atomic i64 0, ptr %mem monotonic, align 8
   %cap.p = getelementptr inbounds nuw i8, ptr %mem, i64 8
-  store i64 %capacity, ptr %cap.p, align 8
+  store i64 %usable, ptr %cap.p, align 8
   ret ptr %mem
 
 fail:
