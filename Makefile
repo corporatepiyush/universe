@@ -79,10 +79,17 @@ DOCKER_PLATFORM ?=
 ALLOW_OLD_KERNEL ?=
 
 .PHONY: all lib dylib test crosscheck clean list docker-build docker-test \
-        docker-test-debian docker-test-alpine docker-test-all \
+        docker-test-debian docker-test-alpine docker-test-all stackcheck \
         $(addprefix test-,$(DOMAINS)) $(addprefix crosscheck-,$(DOMAINS))
 
 all: lib dylib $(TESTBIN)
+
+# Static stack-overflow gate — MANDATORY before every commit. Flags loop-body
+# allocas (hazard #11: unbounded frame growth → overflow), unguarded dynamic
+# allocas, and oversized stack frames. STRICT on src/ (the shipping library);
+# advisory on tests/. `make stackcheck STRICT=1` fails on tests/ too.
+stackcheck:
+	@python3 tools/stackcheck.py $(if $(STRICT),--strict-all,)
 
 docker-build:
 	docker build $(if $(DOCKER_PLATFORM),--platform $(DOCKER_PLATFORM),) \

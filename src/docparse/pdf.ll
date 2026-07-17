@@ -212,6 +212,12 @@ done:
 ; ======================================================================= open
 define i32 @universe_docparse_pdf_open(ptr %buf, i64 %len, ptr %doc) #1 {
 entry:
+  ; scratch out-param slots hoisted to entry (hazard #11: never alloca in a loop —
+  ; the xref subsection/entry loops reuse these single slots each iteration).
+  %pstart = alloca i64, align 8
+  %pcount = alloca i64, align 8
+  %poff = alloca i64, align 8
+  %pgen = alloca i64, align 8
   %bn = icmp eq ptr %buf, null
   %dn = icmp eq ptr %doc, null
   %anull = or i1 %bn, %dn
@@ -299,8 +305,6 @@ sub.chktrail:
 fin_ok:
   ret i32 0
 sub.head:
-  %pstart = alloca i64, align 8
-  %pcount = alloca i64, align 8
   %hs = call i64 @pdf_uint(ptr %buf, i64 %len, i64 %subws, ptr %pstart)
   %hws = call i64 @pdf_skipws(ptr %buf, i64 %len, i64 %hs)
   %hc = call i64 @pdf_uint(ptr %buf, i64 %len, i64 %hws, ptr %pcount)
@@ -313,8 +317,6 @@ ent.loop:
   %kdone = icmp uge i64 %k, %subcount
   br i1 %kdone, label %ent.after, label %ent.read
 ent.read:
-  %poff = alloca i64, align 8
-  %pgen = alloca i64, align 8
   %ew1 = call i64 @pdf_skipws(ptr %buf, i64 %len, i64 %ecur)
   %eo = call i64 @pdf_uint(ptr %buf, i64 %len, i64 %ew1, ptr %poff)
   %ew2 = call i64 @pdf_skipws(ptr %buf, i64 %len, i64 %eo)

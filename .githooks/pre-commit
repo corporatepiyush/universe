@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Mandatory pre-commit stack-overflow gate. Blocks any commit that introduces a
+# stack-overflow pattern in the shipping library (src/): a loop-body alloca
+# (hazard #11 — unbounded frame growth), an unguarded dynamic alloca, or an
+# oversized stack frame. Advisory-only for tests/. Exempt a verified line with a
+# trailing `; stackcheck-ok: <reason>` comment.
+#
+# Enable once per clone:  git config core.hooksPath .githooks
+set -euo pipefail
+repo="$(git rev-parse --show-toplevel)"
+python3 "$repo/tools/stackcheck.py" || {
+  echo "" >&2
+  echo "COMMIT BLOCKED: stackcheck found a stack-overflow pattern in src/." >&2
+  echo "Hoist loop allocas to the entry block (reuse one slot), wrap dynamic" >&2
+  echo "allocas in llvm.stacksave/stackrestore, or exempt with '; stackcheck-ok: <reason>'." >&2
+  exit 1
+}
