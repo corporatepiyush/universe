@@ -50,6 +50,7 @@ DEPS_http     := io net simd ioring
 DEPS_llm      := http io net simd parse
 DEPS_crypto             := bignum
 DEPS_docparse           := compress parse encoding
+DEPS_dataframe          := sort simd structures_assoc
 DEPS_ml                 := simd
 DEPS_structures_succinct := encoding
 DEPS_observ             := concurrent io
