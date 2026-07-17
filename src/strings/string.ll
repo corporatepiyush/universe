@@ -53,6 +53,7 @@
 ;     i1   universe_string_eq(ptr a, i64 alen, ptr b, i64 blen)
 ;     i32  universe_string_compare(ptr a, i64 alen, ptr b, i64 blen) ; <0/0/>0
 ;     i64  universe_string_index_of_byte(ptr data, i64 len, i8 byte)  ; idx or -1
+;     i64  universe_string_count_byte(ptr data, i64 len, i8 byte)     ; # matches
 ;     i64  universe_string_hash(ptr data, i64 len)                    ; deterministic
 ;     i1   universe_string_starts_with(ptr data, i64 len, ptr pre, i64 plen)
 ;     {ptr,i64} universe_string_substring_view(ptr data, i64 len, i64 start, i64 count)
@@ -77,6 +78,7 @@ declare i64 @llvm.umin.i64(i64, i64)
 declare i1  @universe_simd_equal(ptr readonly, ptr readonly, i64)
 declare i32 @universe_simd_compare(ptr readonly, ptr readonly, i64)
 declare i64 @universe_simd_find_byte(ptr readonly, i64, i8)
+declare i64 @universe_simd_count_byte(ptr readonly, i64, i8)
 
 ; ---------------------------------------------------------------------------
 ; STRING VIEW (pure, no allocation)
@@ -129,6 +131,14 @@ by.len:
 define i64 @universe_string_index_of_byte(ptr %data, i64 %len, i8 %byte) local_unnamed_addr #0 {
 entry:
   %r = call i64 @universe_simd_find_byte(ptr %data, i64 %len, i8 %byte)
+  ret i64 %r
+}
+
+; Count occurrences of a byte — the vector count kernel (n == 0 -> 0). %data is
+; the argument buffer itself, read directly, so this stays memory(argmem: read).
+define i64 @universe_string_count_byte(ptr %data, i64 %len, i8 %byte) local_unnamed_addr #0 {
+entry:
+  %r = call i64 @universe_simd_count_byte(ptr %data, i64 %len, i8 %byte)
   ret i64 %r
 }
 
