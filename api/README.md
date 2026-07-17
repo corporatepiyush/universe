@@ -69,7 +69,7 @@ clang -O3 mycli.c build/libuniverse.a -lpthread -lm -o mycli
 
 | Domain | Modules | What it covers |
 |---|---:|---|
-| [allocator](allocator/) | 7 | arena, pool, slab, buddy, TLSF (+ concurrent arena/pool) |
+| [allocator](allocator/) | 6 | arena, pool, slab, buddy, TLSF (growable), hybrid (TLSF+slab) — single-threaded; caller adds a mutex if shared |
 | [bignum](bignum/) | 1 | arbitrary-precision integers, modexp/Montgomery |
 | [common](common/) | 1 | shared primitives (rotl/rotr, big-endian load/store, checked math) |
 | [compress](compress/) | 5 | inflate/DEFLATE, LZ4, Snappy, Zstd, ZIP |

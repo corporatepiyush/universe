@@ -8,7 +8,7 @@ exactly one cache line and the payload starts 64 B in. `used` is kept
 the size, never the cursor. All size math is overflow-checked. Choose the
 arena when you allocate many objects with a shared lifetime and free them all
 at once (parse trees, per-request scratch, frame allocators). Single-threaded;
-see `arena_concurrent` for the wait-free multi-thread variant.
+for concurrent use, guard it with a mutex in the caller.
 
 ## Exported API
 | C signature | Description | Returns |
@@ -77,5 +77,5 @@ clang -O3 arena_demo.c build/libuniverse.a -lpthread -lm -o arena_demo
 ## Notes
 - One `malloc` per arena; payload 16-aligned. Individual blocks are never
   freed — only `reset` (reuse) or `destroy` (release everything).
-- Not thread-safe; use `arena_concurrent` for concurrent bump allocation.
+- Not thread-safe; the caller adds a mutex if the arena is shared across threads.
 - Pointers returned stay valid until the next `reset` or `destroy`.

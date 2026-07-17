@@ -8,7 +8,7 @@ blocks come from a bump cursor and the free list only ever holds blocks that
 were actually freed. The free list stores byte offsets (intrusive, inside the
 freed block) so alloc/free do zero multiplications. Choose the pool for
 uniform-size objects with individual lifetimes (nodes, cells, fixed records).
-Single-threaded; see `pool_concurrent` for the lock-free variant.
+Single-threaded; for concurrent use, guard it with a mutex in the caller.
 
 ## Exported API
 | C signature | Description | Returns |
@@ -76,4 +76,4 @@ clang -O3 pool_demo.c build/libuniverse.a -lpthread -lm -o pool_demo
 - Every block is 16-byte aligned; block stride is the 16-aligned `block_size`.
 - `free` must be passed a pointer previously returned by this pool; double-free
   detection is deferred (hardening phase).
-- Not thread-safe; use `pool_concurrent` for concurrent alloc/free.
+- Not thread-safe; the caller adds a mutex if the pool is shared across threads.
