@@ -15,9 +15,9 @@ return `int64_t` counts.
 | [arena](arena.md) | Bump allocator; many objects, shared lifetime, free-all-at-once | single-threaded |
 | [pool](pool.md) | Fixed-size blocks, O(1) alloc/free, individual lifetimes | single-threaded |
 | [slab](slab.md) | Fixed-size objects, growable, empty slabs returned to OS | single-threaded |
-| [buddy](buddy.md) | Power-of-two blocks, O(1) coalescing, sized-free API | single-threaded |
-| [tlsf](tlsf.md) | General variable-size, O(1) worst-case alloc/free, bounded fragmentation | single-threaded |
 
-Selection guide: shared-lifetime batch → arena; uniform blocks → pool;
-growing/shrinking uniform set → slab; general variable-size with real reuse →
-tlsf; power-of-two with fast merge and sizes tracked at the call site → buddy.
+Selection guide: shared-lifetime batch / build scratch → arena; uniform fixed-size
+blocks (nodes, cells) → pool (bounded) or slab (growable). These three are the
+benchmark winners for their patterns (see BENCHMARKS.md). A general variable-size
+allocator (TLSF/buddy/hybrid) was removed for now and will be revisited; until it
+returns there is no general-purpose allocator in the SDK.
