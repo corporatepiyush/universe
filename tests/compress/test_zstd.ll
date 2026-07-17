@@ -24,6 +24,7 @@ declare void @ut_check_eq(i64, i64, ptr)
 declare i32 @ut_summary()
 declare i32 @memcmp(ptr, ptr, i64)
 declare ptr @malloc(i64)
+declare void @free(ptr)
 declare i64 @universe_compress_zstd_decode(ptr, i64, ptr, i64)
 
 @m.rawlen = private constant [23 x i8] c"raw decode len\00\00\00\00\00\00\00\00\00"
@@ -102,6 +103,7 @@ entry:
   %flok = icmp eq i64 %fl, -6
   call void @ut_check(i1 %flok, ptr @m.full)
 
+  call void @free(ptr %out)
   %r = call i32 @ut_summary()
   ret i32 %r
 }
