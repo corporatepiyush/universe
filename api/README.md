@@ -69,7 +69,7 @@ clang -O3 mycli.c build/libuniverse.a -lpthread -lm -o mycli
 
 | Domain | Modules | What it covers |
 |---|---:|---|
-| [allocator](allocator/) | 3 | **slab (default, injectable)**, pool (fixed bounded), arena (intra-module scratch bursts) — single-threaded; general-purpose TLSF/buddy/hybrid removed for now (see BENCHMARKS.md) |
+| [allocator](allocator/) | 1 | arena (optional intra-module scratch bursts) — the project uses native malloc/realloc/free directly for now; pool/slab/tlsf/buddy/hybrid removed, SDK-allocator migration deferred (see BENCHMARKS.md) |
 | [bignum](bignum/) | 1 | arbitrary-precision integers, modexp/Montgomery |
 | [common](common/) | 1 | shared primitives (rotl/rotr, big-endian load/store, checked math) |
 | [compress](compress/) | 5 | inflate/DEFLATE, LZ4, Snappy, Zstd, ZIP |

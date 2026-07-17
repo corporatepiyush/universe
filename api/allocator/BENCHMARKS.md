@@ -1,9 +1,10 @@
 # Allocator benchmark — which default, which module
 
-> STATUS: `tlsf`, `buddy`, and `hybrid` have been REMOVED from the SDK for now
-> (to be revisited). Only `arena`, `pool`, and `slab` — the pattern winners below
-> — remain. This report is retained as the reference data + rationale for that
-> decision and for reintroducing a growable general-purpose allocator later.
+> STATUS: the SDK now ships ONLY `arena`. `pool`, `slab`, `tlsf`, `buddy`, and
+> `hybrid` have been removed for now, and the project uses native malloc/realloc/
+> free directly (the SDK-allocator migration is deferred). This report is retained
+> as the reference data + rationale for reintroducing a growable general-purpose
+> allocator (a growable buddy) when the migration is taken up.
 
 Measured with `tests/blackbox/bb_alloc_bench.c` (public C ABI, linked against
 `build/libuniverse.a`), on **real Linux kernel 6.17** under **both glibc (Debian)
