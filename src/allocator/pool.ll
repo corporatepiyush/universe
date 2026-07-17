@@ -62,7 +62,12 @@ entry:
   br i1 %ovf, label %fail, label %alloc, !prof !0
 
 alloc:
-  %mem = call ptr @malloc(i64 %total)
+  ; OS-request floor: never malloc less than ALLOC_OS_MIN (16384) for backing
+  ; memory. The pool bounds allocation by the stored `limit` (= stride*count),
+  ; not by the malloc size, so a floored request over a small pool is harmless
+  ; slack — capacity/behavior are unchanged, the OS request is just >= 16 KiB.
+  %os.req = call i64 @llvm.umax.i64(i64 %total, i64 16384)
+  %mem = call ptr @malloc(i64 %os.req)
   %mem.null = icmp eq ptr %mem, null
   br i1 %mem.null, label %fail, label %init, !prof !0
 

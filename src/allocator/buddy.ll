@@ -218,7 +218,11 @@ shape:
   %pay.al = add i64 %pay.raw, 63
   %payoff = and i64 %pay.al, -64
   %grand = add i64 %payoff, %total
-  %mem = call ptr @malloc(i64 %grand)
+  ; OS-request floor (ALLOC_OS_MIN=16384): never malloc less than 16 KiB for the
+  ; backing region. The buddy tree still manages exactly %total payload bytes at
+  ; %payoff; a floored request over a small region is harmless slack.
+  %os.req = call i64 @llvm.umax.i64(i64 %grand, i64 16384)
+  %mem = call ptr @malloc(i64 %os.req)
   %mem.null = icmp eq ptr %mem, null
   br i1 %mem.null, label %fail, label %init, !prof !0
 

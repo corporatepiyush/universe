@@ -79,7 +79,12 @@ pow2:
   %lz = call i64 @llvm.ctlz.i64(i64 %nm1, i1 true)
   %shift = sub nuw nsw i64 64, %lz
   %span = shl nuw i64 1, %shift
-  %h = call ptr @malloc(i64 48)
+  ; OS-request floor (ALLOC_OS_MIN=16384): slab backing chunks (posix_memalign
+  ; span) are >= 16 KiB. span stays a power of two (16384 = 2^14) so the
+  ; span-alignment / mask-down-to-header invariant holds. The control handle is
+  ; also floored (one-time metadata; objects live in the span chunks, not here).
+  %span.f = call i64 @llvm.umax.i64(i64 %span, i64 16384)
+  %h = call ptr @malloc(i64 16384)
   %h.null = icmp eq ptr %h, null
   br i1 %h.null, label %fail, label %init, !prof !0
 
@@ -90,7 +95,7 @@ init:
   %stride.p = getelementptr inbounds nuw i8, ptr %h, i64 16
   store i64 %stride, ptr %stride.p, align 8
   %span.p = getelementptr inbounds nuw i8, ptr %h, i64 24
-  store i64 %span, ptr %span.p, align 8
+  store i64 %span.f, ptr %span.p, align 8
   %live.p = getelementptr inbounds nuw i8, ptr %h, i64 32
   store i64 0, ptr %live.p, align 8
   %objs.p = getelementptr inbounds nuw i8, ptr %h, i64 40
