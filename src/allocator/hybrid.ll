@@ -63,7 +63,10 @@
 ;       +24 i64 slab_chunk     ; target bytes/slab refill chunk (objs derived)
 ;       +32 i64 tlsf_initial   ; initial TLSF region size (growable large path)
 ;     Defaults (cfg==NULL): small_max=512, class_sizes=NULL, slab_chunk=64 KiB,
-;     tlsf_initial=1 MiB. When class_sizes==NULL a STEP-16 schedule is generated
+;     tlsf_initial=1 MiB. slab_chunk and tlsf_initial are OS-backed regions, so
+;     each is CLAMPED UP to ALLOC_OS_MIN=16384 (16 KiB) after the zero=>default
+;     substitution — a tuned-tiny config still honors the 16 KiB OS-request floor.
+;     When class_sizes==NULL a STEP-16 schedule is generated
 ;     (16,32,48,64,...,ceil(small_max/16)*16); nclasses = ceil(small_max/16) and
 ;     small_max is snapped up to the top class. When class_sizes!=NULL the
 ;     provided ascending boundaries are used verbatim and small_max is set to
@@ -167,11 +170,15 @@ haveconf:
   %csin = phi ptr [ null, %defaults ], [ %csr, %readcfg ]
   %chunk0 = phi i64 [ 65536, %defaults ], [ %chr, %readcfg ]
   %tinit0 = phi i64 [ 1048576, %defaults ], [ %tir, %readcfg ]
-  ; sanitize zero-valued knobs to defaults
+  ; sanitize zero-valued knobs to defaults, then CLAMP UP to the OS-request floor
+  ; ALLOC_OS_MIN=16384: a tuned-tiny slab_chunk/tlsf_initial still yields >= 16 KiB
+  ; OS-backed regions (defaults 64 KiB / 1 MiB already comply). 0 => "use default".
   %chz = icmp eq i64 %chunk0, 0
-  %chunk = select i1 %chz, i64 65536, i64 %chunk0
+  %chunk1 = select i1 %chz, i64 65536, i64 %chunk0
+  %chunk = call i64 @llvm.umax.i64(i64 %chunk1, i64 16384)
   %tiz = icmp eq i64 %tinit0, 0
-  %tinit = select i1 %tiz, i64 1048576, i64 %tinit0
+  %tinit1 = select i1 %tiz, i64 1048576, i64 %tinit0
+  %tinit = call i64 @llvm.umax.i64(i64 %tinit1, i64 16384)
   %hascs = icmp ne ptr %csin, null
   br i1 %hascs, label %useprov, label %gen
 
