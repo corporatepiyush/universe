@@ -86,6 +86,8 @@ declare i32 @ut_summary()
 @u8.asamp = internal global [16 x double] zeroinitializer, align 8
 @lbl.u8mixed = private unnamed_addr constant [26 x i8] c"utf8 validate 4byte 65536\00"
 @lbl.u8ascii = private unnamed_addr constant [26 x i8] c"utf8 validate ascii 65536\00"
+@m.mxv = private unnamed_addr constant [24 x i8] c"mixed multibyte valid-1\00"
+@m.mxc = private unnamed_addr constant [24 x i8] c"mixed count == tracked \00"
 
 define i32 @main(i32 %argc, ptr %argv) {
 entry:
@@ -220,6 +222,78 @@ oo.fin:
   call void @ut_check_eq(i64 %vm.n, i64 0, ptr @m.oav)
   call void @ut_check_eq(i64 %cm.n, i64 0, ptr @m.oac)
   call void @ut_check_eq(i64 %im.n, i64 0, ptr @m.oai)
+
+  ; ---- mixed-multibyte oracle: exercise the vector ASCII-skip -> scalar
+  ; multibyte handoff. Build a buffer of random VALID codepoints (ASCII-biased
+  ; so >=16-run ASCII chunks hit the vector fast path, interleaved with 2/3/4-
+  ; byte sequences forcing the scalar path), tracking the exact codepoint count.
+  ; The fused vector+scalar validate MUST accept (-1) and count MUST equal the
+  ; independently tracked count. ----
+  store i64 88172645463325252, ptr %ostate, align 8
+  br label %mg.head
+
+mg.head:
+  %mgi = phi i64 [ 0, %oo.fin ], [ %mgi.nx, %mg.next ]
+  %mgc = phi i64 [ 0, %oo.fin ], [ %mgc.nx, %mg.next ]
+  %mgstop = icmp uge i64 %mgc, 6000
+  %mgp4 = add nuw i64 %mgi, 4
+  %mgroom = icmp ule i64 %mgp4, 65500
+  %mgok = xor i1 %mgstop, true
+  %mggo = and i1 %mgok, %mgroom
+  br i1 %mggo, label %mg.body, label %mg.done
+
+mg.body:
+  %mr = call i64 @ut_rand(ptr %ostate)
+  %mk = and i64 %mr, 7
+  %mp = lshr i64 %mr, 3
+  %dp0 = getelementptr inbounds nuw [65536 x i8], ptr @g.buf, i64 0, i64 %mgi
+  switch i64 %mk, label %mg.ascii [ i64 5, label %mg.two
+                                    i64 6, label %mg.three
+                                    i64 7, label %mg.four ]
+
+mg.ascii:
+  %ac = and i64 %mp, 127
+  %ac8 = trunc i64 %ac to i8
+  store i8 %ac8, ptr %dp0, align 1
+  br label %mg.next
+
+mg.two:                                            ; U+00E9 = C3 A9
+  store i8 -61, ptr %dp0, align 1
+  %tp1 = getelementptr inbounds nuw i8, ptr %dp0, i64 1
+  store i8 -87, ptr %tp1, align 1
+  br label %mg.next
+
+mg.three:                                          ; U+20AC = E2 82 AC
+  store i8 -30, ptr %dp0, align 1
+  %hp1 = getelementptr inbounds nuw i8, ptr %dp0, i64 1
+  store i8 -126, ptr %hp1, align 1
+  %hp2 = getelementptr inbounds nuw i8, ptr %dp0, i64 2
+  store i8 -84, ptr %hp2, align 1
+  br label %mg.next
+
+mg.four:                                           ; U+1F600 = F0 9F 98 80
+  store i8 -16, ptr %dp0, align 1
+  %fp1 = getelementptr inbounds nuw i8, ptr %dp0, i64 1
+  store i8 -97, ptr %fp1, align 1
+  %fp2 = getelementptr inbounds nuw i8, ptr %dp0, i64 2
+  store i8 -104, ptr %fp2, align 1
+  %fp3 = getelementptr inbounds nuw i8, ptr %dp0, i64 3
+  store i8 -128, ptr %fp3, align 1
+  br label %mg.next
+
+mg.next:
+  %mlen = phi i64 [ 1, %mg.ascii ], [ 2, %mg.two ], [ 3, %mg.three ], [ 4, %mg.four ]
+  %mgi.nx = add nuw i64 %mgi, %mlen
+  %mgc.nx = add nuw i64 %mgc, 1
+  br label %mg.head
+
+mg.done:
+  %mgv = call i64 @universe_utf8_validate(ptr @g.buf, i64 %mgi)
+  %mgveq = icmp eq i64 %mgv, -1
+  call void @ut_check(i1 %mgveq, ptr @m.mxv)
+  %mgcnt = call i64 @universe_utf8_count_codepoints(ptr @g.buf, i64 %mgi)
+  %mgceq = icmp eq i64 %mgcnt, %mgc
+  call void @ut_check(i1 %mgceq, ptr @m.mxc)
 
   ; ---- bench ----
   %wb = call i1 @ut_want_bench(i32 %argc, ptr %argv)

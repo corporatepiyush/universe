@@ -38,6 +38,21 @@
 ;     only bounds-checks against dcap (cold FULL exit).
 ;   * The hot loops keep only the ASCII/BMP fall-through and cold error/FULL
 ;     branches (!prof weighted); scalar classification is branchless selects.
+;   * SIMD-first transcode fast path (from_utf8 / to_utf8): a portable
+;     <16 x i8>/<16 x i16> ASCII lane is the PRIMARY path and the scalar
+;     codepoint loop is the tail + oracle. At a codepoint/unit boundary, when
+;     the output is little-endian (be==0) and 16 source bytes/units and 16 dst
+;     units/bytes fit, we vector-probe the chunk: from_utf8 loads 16 bytes,
+;     `icmp slt` vs 0 flags any high bit (>=0x80); if none, `zext <16 x i8> ->
+;     <16 x i16>` widens 16 ASCII bytes to 16 LE code units in one store.
+;     to_utf8 loads 16 code units, `icmp ugt` vs 127 flags any non-ASCII; if
+;     none, `trunc <16 x i16> -> <16 x i8>` narrows 16 units to 16 bytes in one
+;     store. The instant a lane is non-ASCII (or fewer than 16 remain, or be!=0)
+;     we fall to the scalar per-codepoint path, which handles every multibyte
+;     sequence and surrogate pair and is the cross-check oracle in tests. ASCII
+;     lanes are never surrogates/overlong, so accept/reject and the emitted
+;     bytes are byte-identical to the scalar path. Both lower to SSE2 / NEON at
+;     the 128-bit baseline (no runtime feature check).
 ;
 ; ERROR CONVENTION (documented; matches sibling encoding modules): i64-returning
 ; entry points return a NON-NEGATIVE result on success (a scalar value, a unit
@@ -58,6 +73,7 @@
 ;   i64 universe_utf16_to_utf8(ptr dst, i64 dcap, ptr src, i64 nunits, i32 be)   ; bytes, or <0
 
 declare i16 @llvm.bswap.i16(i16)
+declare i1 @llvm.vector.reduce.or.v16i1(<16 x i1>)
 
 ; reused from the sibling UTF-8 module (functional reuse, not reimplemented)
 declare i64 @universe_utf8_validate(ptr, i64)
@@ -461,21 +477,51 @@ define i64 @universe_utf16_from_utf8(ptr %dst, i64 %dcap, ptr %src, i64 %n, i32 
 entry:
   %vr = call i64 @universe_utf8_validate(ptr %src, i64 %n)
   %valid = icmp eq i64 %vr, -1
-  br i1 %valid, label %pre, label %bad, !prof !0
+  br i1 %valid, label %loop, label %bad, !prof !0
 
 bad:                                              ; cold — malformed UTF-8
   ret i64 -13
 
-pre:
-  %empty = icmp eq i64 %n, 0
-  br i1 %empty, label %zero, label %loop
-
-zero:
-  ret i64 0
-
+; head-checked loop over codepoint boundaries; %out accumulates units written.
+; An empty range falls straight through to %fin returning 0.
 loop:
-  %i = phi i64 [ 0, %pre ], [ %i.next, %cont ]
-  %out = phi i64 [ 0, %pre ], [ %oend, %cont ]
+  %i = phi i64 [ 0, %entry ], [ %i.next, %cont ], [ %vi2, %vemit ]
+  %out = phi i64 [ 0, %entry ], [ %oend, %cont ], [ %vout2, %vemit ]
+  %done = icmp uge i64 %i, %n
+  br i1 %done, label %fin, label %vprobe
+
+fin:
+  ret i64 %out
+
+; SIMD-first ASCII fast path: little-endian output, 16 src bytes and 16 dst
+; units in range. Non-ASCII lane / short remainder / big-endian -> scalar body.
+vprobe:
+  %isle = icmp eq i32 %be, 0
+  %i16 = add nuw i64 %i, 16
+  %ifit = icmp ule i64 %i16, %n
+  %vc0 = and i1 %isle, %ifit
+  %o16 = add nuw i64 %out, 16
+  %ofit = icmp ule i64 %o16, %dcap
+  %vok = and i1 %vc0, %ofit
+  br i1 %vok, label %vtry, label %body
+
+vtry:
+  %vp = getelementptr inbounds nuw i8, ptr %src, i64 %i
+  %vv = load <16 x i8>, ptr %vp, align 1
+  %vneg = icmp slt <16 x i8> %vv, zeroinitializer   ; high bit set -> >= 0x80
+  %vany = call i1 @llvm.vector.reduce.or.v16i1(<16 x i1> %vneg)
+  br i1 %vany, label %body, label %vemit, !prof !1
+
+vemit:
+  %vw = zext <16 x i8> %vv to <16 x i16>
+  %obytes = shl nuw i64 %out, 1
+  %vdp = getelementptr inbounds nuw i8, ptr %dst, i64 %obytes
+  store <16 x i16> %vw, ptr %vdp, align 1
+  %vi2 = add nuw i64 %i, 16
+  %vout2 = add nuw i64 %out, 16
+  br label %loop
+
+body:
   %lp = getelementptr inbounds nuw i8, ptr %src, i64 %i
   %lead = load i8, ptr %lp, align 1
   %len32 = call i32 @universe_utf8_byte_len_of_codepoint(i8 %lead)
@@ -510,26 +556,56 @@ emit2:
 
 cont:
   %i.next = add nuw i64 %i, %len
-  %more = icmp ult i64 %i.next, %n
-  br i1 %more, label %loop, label %fin
-
-fin:
-  ret i64 %oend
+  br label %loop
 }
 
 ; ---------------------------------------------------------------- to_utf8
 ; transcode UTF-16 -> UTF-8 into caller-sized dst (dcap bytes); bytes written or <0
 define i64 @universe_utf16_to_utf8(ptr %dst, i64 %dcap, ptr %src, i64 %nunits, i32 %be) local_unnamed_addr #2 {
 entry:
-  %empty = icmp eq i64 %nunits, 0
-  br i1 %empty, label %zero, label %loop
+  br label %loop
 
-zero:
-  ret i64 0
-
+; head-checked loop over unit boundaries; %out accumulates bytes written. An
+; empty range falls straight through to %fin returning 0.
 loop:
-  %i = phi i64 [ 0, %entry ], [ %i.next, %cont ]
-  %out = phi i64 [ 0, %entry ], [ %oend, %cont ]
+  %i = phi i64 [ 0, %entry ], [ %i.next, %cont ], [ %vi2, %vemit ]
+  %out = phi i64 [ 0, %entry ], [ %oend, %cont ], [ %vout2, %vemit ]
+  %done = icmp uge i64 %i, %nunits
+  br i1 %done, label %fin, label %vprobe
+
+fin:
+  ret i64 %out
+
+; SIMD-first ASCII fast path: little-endian input, 16 src units and 16 dst
+; bytes in range. ASCII units (< 0x80) are never surrogates, so no malformed
+; case can hide here. Non-ASCII lane / short remainder / big-endian -> scalar.
+vprobe:
+  %isle = icmp eq i32 %be, 0
+  %i16 = add nuw i64 %i, 16
+  %ifit = icmp ule i64 %i16, %nunits
+  %vc0 = and i1 %isle, %ifit
+  %o16 = add nuw i64 %out, 16
+  %ofit = icmp ule i64 %o16, %dcap
+  %vok = and i1 %vc0, %ofit
+  br i1 %vok, label %vtry, label %body
+
+vtry:
+  %sboff = shl nuw i64 %i, 1
+  %vp = getelementptr inbounds nuw i8, ptr %src, i64 %sboff
+  %vv = load <16 x i16>, ptr %vp, align 1
+  %vhi = icmp ugt <16 x i16> %vv, splat (i16 127)   ; any unit >= 0x80
+  %vany = call i1 @llvm.vector.reduce.or.v16i1(<16 x i1> %vhi)
+  br i1 %vany, label %body, label %vemit, !prof !1
+
+vemit:
+  %vn = trunc <16 x i16> %vv to <16 x i8>
+  %vdp = getelementptr inbounds nuw i8, ptr %dst, i64 %out
+  store <16 x i8> %vn, ptr %vdp, align 1
+  %vi2 = add nuw i64 %i, 16
+  %vout2 = add nuw i64 %out, 16
+  br label %loop
+
+body:
   %boff = shl nuw i64 %i, 1
   %srcp = getelementptr inbounds nuw i8, ptr %src, i64 %boff
   %avail = sub nuw i64 %nunits, %i
@@ -559,11 +635,7 @@ emit:
 
 cont:
   %i.next = add nuw i64 %i, %uc
-  %more = icmp ult i64 %i.next, %nunits
-  br i1 %more, label %loop, label %fin
-
-fin:
-  ret i64 %oend
+  br label %loop
 }
 
 attributes #0 = { nounwind willreturn norecurse nosync nofree memory(argmem: read) }
