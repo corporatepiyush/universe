@@ -21,6 +21,7 @@ declare i64 @universe_string_len(ptr, i64)
 declare i1 @universe_string_eq(ptr, i64, ptr, i64)
 declare i32 @universe_string_compare(ptr, i64, ptr, i64)
 declare i64 @universe_string_index_of_byte(ptr, i64, i8)
+declare i64 @universe_string_count_byte(ptr, i64, i8)
 declare i64 @universe_string_hash(ptr, i64)
 declare i1 @universe_string_starts_with(ptr, i64, ptr, i64)
 declare { ptr, i64 } @universe_string_substring_view(ptr, i64, i64, i64)
@@ -34,6 +35,7 @@ declare ptr @malloc(i64)
 declare void @free(ptr)
 declare i32 @memcmp(ptr, ptr, i64)
 declare i32 @printf(ptr, ...)
+declare i64 @llvm.umin.i64(i64, i64)
 
 declare void @ut_check(i1, ptr)
 declare void @ut_check_eq(i64, i64, ptr)
@@ -76,6 +78,8 @@ declare i32 @ut_summary()
 @s.ssonull  = private unnamed_addr constant [15 x i8] c"sso null out 1\00"
 @s.ssosrc   = private unnamed_addr constant [15 x i8] c"sso null src 1\00"
 @s.utf8     = private unnamed_addr constant [14 x i8] c"utf8 bytes ok\00"
+@o.lens = private unnamed_addr constant [8 x i64] [i64 0, i64 1, i64 15, i64 16, i64 17, i64 64, i64 255, i64 1024]
+@s.oracle = private unnamed_addr constant [26 x i8] c"simd vs scalar oracle (0)\00"
 @sso.shsamp = internal global [16 x double] zeroinitializer, align 8
 @sso.hpsamp = internal global [16 x double] zeroinitializer, align 8
 @sso.sink = internal global i64 0, align 8
@@ -332,12 +336,239 @@ hp.report:
   ret void
 }
 
+; ---------------------------------------------------------------------------
+; SIMD-vs-scalar oracle. string_eq/compare/index_of_byte/count_byte route
+; through the 128-bit vector kernels in src/simd/scan.ll; these in-test scalar
+; references are the oracle. Fixed-seed random buffers at every edge length
+; (0/1/15/16/17 straddle the 16-byte vector stride, plus 64/255/1024) must
+; produce bit-identical results from the vector path and the scalar reference.
+; ---------------------------------------------------------------------------
+
+define internal i32 @sgn(i32 %x) {
+entry:
+  %pos = icmp sgt i32 %x, 0
+  %neg = icmp slt i32 %x, 0
+  %p = zext i1 %pos to i32
+  %n = zext i1 %neg to i32
+  %r = sub i32 %p, %n
+  ret i32 %r
+}
+
+define internal i64 @ref_find(ptr %p, i64 %n, i8 %c) {
+entry:
+  %z = icmp eq i64 %n, 0
+  br i1 %z, label %nf, label %loop
+loop:
+  %i = phi i64 [ 0, %entry ], [ %i.n, %cont ]
+  %pp = getelementptr inbounds nuw i8, ptr %p, i64 %i
+  %b = load i8, ptr %pp, align 1
+  %eq = icmp eq i8 %b, %c
+  br i1 %eq, label %found, label %cont
+found:
+  ret i64 %i
+cont:
+  %i.n = add nuw i64 %i, 1
+  %more = icmp ult i64 %i.n, %n
+  br i1 %more, label %loop, label %nf
+nf:
+  ret i64 -1
+}
+
+define internal i64 @ref_count(ptr %p, i64 %n, i8 %c) {
+entry:
+  %z = icmp eq i64 %n, 0
+  br i1 %z, label %done, label %loop
+loop:
+  %i = phi i64 [ 0, %entry ], [ %i.n, %loop ]
+  %acc = phi i64 [ 0, %entry ], [ %acc.n, %loop ]
+  %pp = getelementptr inbounds nuw i8, ptr %p, i64 %i
+  %b = load i8, ptr %pp, align 1
+  %eq = icmp eq i8 %b, %c
+  %inc = zext i1 %eq to i64
+  %acc.n = add nuw i64 %acc, %inc
+  %i.n = add nuw i64 %i, 1
+  %more = icmp ult i64 %i.n, %n
+  br i1 %more, label %loop, label %done
+done:
+  %r = phi i64 [ 0, %entry ], [ %acc.n, %loop ]
+  ret i64 %r
+}
+
+define internal i1 @ref_eq(ptr %a, i64 %an, ptr %b, i64 %bn) {
+entry:
+  %leq = icmp eq i64 %an, %bn
+  br i1 %leq, label %scan, label %no
+scan:
+  %z = icmp eq i64 %an, 0
+  br i1 %z, label %yes, label %loop
+loop:
+  %i = phi i64 [ 0, %scan ], [ %i.n, %cont ]
+  %ap = getelementptr inbounds nuw i8, ptr %a, i64 %i
+  %av = load i8, ptr %ap, align 1
+  %bp = getelementptr inbounds nuw i8, ptr %b, i64 %i
+  %bv = load i8, ptr %bp, align 1
+  %ne = icmp ne i8 %av, %bv
+  br i1 %ne, label %no, label %cont
+cont:
+  %i.n = add nuw i64 %i, 1
+  %more = icmp ult i64 %i.n, %an
+  br i1 %more, label %loop, label %yes
+yes:
+  ret i1 true
+no:
+  ret i1 false
+}
+
+define internal i32 @ref_cmp(ptr %a, i64 %an, ptr %b, i64 %bn) {
+entry:
+  %min = call i64 @llvm.umin.i64(i64 %an, i64 %bn)
+  %z = icmp eq i64 %min, 0
+  br i1 %z, label %bylen, label %loop
+loop:
+  %i = phi i64 [ 0, %entry ], [ %i.n, %cont ]
+  %ap = getelementptr inbounds nuw i8, ptr %a, i64 %i
+  %ab = load i8, ptr %ap, align 1
+  %au = zext i8 %ab to i32
+  %bp = getelementptr inbounds nuw i8, ptr %b, i64 %i
+  %bb = load i8, ptr %bp, align 1
+  %bu = zext i8 %bb to i32
+  %ne = icmp ne i32 %au, %bu
+  br i1 %ne, label %diff, label %cont
+diff:
+  %d = sub nsw i32 %au, %bu
+  ret i32 %d
+cont:
+  %i.n = add nuw i64 %i, 1
+  %more = icmp ult i64 %i.n, %min
+  br i1 %more, label %loop, label %bylen
+bylen:
+  %lt = icmp ult i64 %an, %bn
+  %gt = icmp ugt i64 %an, %bn
+  %gti = zext i1 %gt to i32
+  %lti = zext i1 %lt to i32
+  %r = sub nsw i32 %gti, %lti
+  ret i32 %r
+}
+
+; eq + compare violations for one (a,an,b,bn) pair (0 if both agree).
+define internal i64 @chk_ec(ptr %a, i64 %an, ptr %b, i64 %bn) {
+entry:
+  %ge = call i1 @universe_string_eq(ptr %a, i64 %an, ptr %b, i64 %bn)
+  %re = call i1 @ref_eq(ptr %a, i64 %an, ptr %b, i64 %bn)
+  %be = xor i1 %ge, %re
+  %gc = call i32 @universe_string_compare(ptr %a, i64 %an, ptr %b, i64 %bn)
+  %rc = call i32 @ref_cmp(ptr %a, i64 %an, ptr %b, i64 %bn)
+  %gs = call i32 @sgn(i32 %gc)
+  %rs = call i32 @sgn(i32 %rc)
+  %bc = icmp ne i32 %gs, %rs
+  %o = or i1 %be, %bc
+  %z = zext i1 %o to i64
+  ret i64 %z
+}
+
+; find + count violations for one target byte over (p,n) (0 if both agree).
+define internal i64 @chk_ft(ptr %p, i64 %n, i8 %c) {
+entry:
+  %gf = call i64 @universe_string_index_of_byte(ptr %p, i64 %n, i8 %c)
+  %rf = call i64 @ref_find(ptr %p, i64 %n, i8 %c)
+  %bf = icmp ne i64 %gf, %rf
+  %gc = call i64 @universe_string_count_byte(ptr %p, i64 %n, i8 %c)
+  %rc = call i64 @ref_count(ptr %p, i64 %n, i8 %c)
+  %bc = icmp ne i64 %gc, %rc
+  %o = or i1 %bf, %bc
+  %z = zext i1 %o to i64
+  ret i64 %z
+}
+
+define internal void @test_simd_oracle() {
+entry:
+  %seed = alloca i64, align 8
+  store i64 88172645463325252, ptr %seed, align 8
+  %a = call ptr @malloc(i64 1024)
+  %b = call ptr @malloc(i64 1024)
+  br label %L.head
+
+L.head:
+  %li = phi i64 [ 0, %entry ], [ %li.n, %L.cont ]
+  %viol = phi i64 [ 0, %entry ], [ %viol.n, %L.cont ]
+  %ldone = icmp uge i64 %li, 8
+  br i1 %ldone, label %L.done, label %L.body
+
+L.body:
+  %lp = getelementptr inbounds [8 x i64], ptr @o.lens, i64 0, i64 %li
+  %L = load i64, ptr %lp, align 8
+  br label %fill.head
+
+fill.head:
+  %fi = phi i64 [ 0, %L.body ], [ %fi.n, %fill.body ]
+  %fdone = icmp uge i64 %fi, %L
+  br i1 %fdone, label %chk, label %fill.body
+
+fill.body:
+  %rnd = call i64 @ut_rand(ptr %seed)
+  %rm = and i64 %rnd, 3
+  %rb = trunc i64 %rm to i8
+  %ap = getelementptr inbounds nuw i8, ptr %a, i64 %fi
+  store i8 %rb, ptr %ap, align 1
+  %bp = getelementptr inbounds nuw i8, ptr %b, i64 %fi
+  store i8 %rb, ptr %bp, align 1
+  %fi.n = add nuw i64 %fi, 1
+  br label %fill.head
+
+chk:
+  ; equal-length, equal-content pass
+  %e0 = call i64 @chk_ec(ptr %a, i64 %L, ptr %b, i64 %L)
+  %t0 = call i64 @chk_ft(ptr %a, i64 %L, i8 0)
+  %t1 = call i64 @chk_ft(ptr %a, i64 %L, i8 1)
+  %t2 = call i64 @chk_ft(ptr %a, i64 %L, i8 2)
+  %t3 = call i64 @chk_ft(ptr %a, i64 %L, i8 3)
+  %t7 = call i64 @chk_ft(ptr %a, i64 %L, i8 7)
+  %s0 = add i64 %e0, %t0
+  %s1 = add i64 %s0, %t1
+  %s2 = add i64 %s1, %t2
+  %s3 = add i64 %s2, %t3
+  %v0 = add i64 %s3, %t7
+  %pos = icmp ugt i64 %L, 0
+  br i1 %pos, label %mut, label %after
+
+mut:
+  ; unequal length: compare (a,L) with (b,L-1) — exercises the length tiebreak
+  %Lm1 = sub i64 %L, 1
+  %ed = call i64 @chk_ec(ptr %a, i64 %L, ptr %b, i64 %Lm1)
+  ; mutate one byte of b, then equal-length differing content
+  %mid = lshr i64 %L, 1
+  %mp = getelementptr inbounds nuw i8, ptr %b, i64 %mid
+  %ob = load i8, ptr %mp, align 1
+  %fb = xor i8 %ob, -128
+  store i8 %fb, ptr %mp, align 1
+  %em = call i64 @chk_ec(ptr %a, i64 %L, ptr %b, i64 %L)
+  %v1 = add i64 %ed, %em
+  br label %after
+
+after:
+  %vsel = phi i64 [ 0, %chk ], [ %v1, %mut ]
+  %vtot = add i64 %v0, %vsel
+  br label %L.cont
+
+L.cont:
+  %viol.n = add i64 %viol, %vtot
+  %li.n = add nuw i64 %li, 1
+  br label %L.head
+
+L.done:
+  call void @ut_check_eq(i64 %viol, i64 0, ptr @s.oracle)
+  call void @free(ptr %a)
+  call void @free(ptr %b)
+  ret void
+}
+
 define i32 @main(i32 %argc, ptr %argv) {
 entry:
   call void @test_view()
   call void @test_hash()
   call void @test_sso()
   call void @test_sso_errors()
+  call void @test_simd_oracle()
   %wb = call i1 @ut_want_bench(i32 %argc, ptr %argv)
   br i1 %wb, label %do.bench, label %finish
 do.bench:
