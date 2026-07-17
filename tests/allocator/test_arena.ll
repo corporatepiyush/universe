@@ -51,7 +51,8 @@ declare void @ut_report_dist(ptr, i64, i64, ptr)
 @m.exhaust   = private unnamed_addr constant [20 x i8] c"exhaustion get null\00"
 @m.ovfsize   = private unnamed_addr constant [20 x i8] c"huge size get null \00"
 @m.ovfcreate = private unnamed_addr constant [21 x i8] c"create overflow null\00"
-@m.zerocap   = private unnamed_addr constant [20 x i8] c"zero-cap arena full\00"
+@m.zerocap   = private unnamed_addr constant [20 x i8] c"zero-cap floor cap \00"
+@m.zerofloor = private unnamed_addr constant [24 x i8] c"zero-cap small alloc ok\00"
 @m.reset     = private unnamed_addr constant [19 x i8] c"reset reuses start\00"
 
 define internal void @test_basic() {
@@ -156,9 +157,15 @@ entry:
   br i1 %zero.ok, label %probe, label %skip
 
 probe:
+  ; OS-request floor (new contract): a zero-cap create still backs at least
+  ; 16384 - 64 = 16320 usable bytes, so capacity() reflects the floor and a
+  ; small alloc SUCCEEDS (it no longer reports "full").
+  %zcap = call i64 @universe_alloc_arena_capacity(ptr %zero)
+  %zcap.ok = icmp uge i64 %zcap, 16320
+  call void @ut_check(i1 %zcap.ok, ptr @m.zerocap)
   %p = call ptr @universe_alloc_arena_alloc(ptr %zero, i64 1)
-  %p.null = icmp eq ptr %p, null
-  call void @ut_check(i1 %p.null, ptr @m.zerocap)
+  %p.ok = icmp ne ptr %p, null
+  call void @ut_check(i1 %p.ok, ptr @m.zerofloor)
   call void @universe_alloc_arena_destroy(ptr %zero)
   br label %skip
 
