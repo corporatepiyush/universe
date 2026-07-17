@@ -23,6 +23,10 @@ declare i32  @universe_parse_json_next(ptr, ptr)
 declare i64  @universe_parse_json_error_offset(ptr)
 declare i64  @universe_parse_json_unescape(ptr, ptr, i64)
 declare i32  @universe_parse_json_number_double(ptr, i64, ptr)
+declare i64  @universe_parse_json_scan_ws(ptr, i64, i64)
+declare i64  @universe_parse_json_scan_ws_scalar(ptr, i64, i64)
+declare i64  @universe_parse_json_scan_structural(ptr, i64, i64)
+declare i64  @universe_parse_json_scan_structural_scalar(ptr, i64, i64)
 
 declare i32 @memcmp(ptr, ptr, i64)
 declare i32 @printf(ptr, ...)
@@ -70,6 +74,16 @@ declare i32 @ut_summary()
 @n.d = private unnamed_addr constant [3 x i8] c"0.5"
 
 @walk.exp = private unnamed_addr constant [11 x i32] [ i32 0, i32 9, i32 5, i32 9, i32 2, i32 6, i32 8, i32 3, i32 9, i32 4, i32 1 ]
+
+; SIMD cross-check byte map: whitespace, structural chars, quote, backslash, and
+; a few ordinary bytes — biased so structural/ws bytes land inside 16-byte chunks.
+@sc.map = private unnamed_addr constant [16 x i8] [ i8 32, i8 9, i8 10, i8 13, i8 123, i8 125, i8 91, i8 93, i8 58, i8 44, i8 34, i8 92, i8 97, i8 98, i8 49, i8 50 ]
+; adversarial fixed doc: quotes, escapes, embedded ws/structural, CRLF, control.
+@sc.adv = private unnamed_addr constant [44 x i8] c"  {\22a\5Cn\22: [1,\09-2],\0D\0A \22x\5C\22y\22} , : \22\22 \5C\5C  end\00"
+@sc.msg = private unnamed_addr constant [32 x i8] c"json simd scan == scalar oracle\00"
+
+@sc.seed = internal global i64 0, align 8
+@sc.viol = internal global i64 0, align 8
 
 @g.types = internal global [64 x i32] zeroinitializer, align 16
 @g.dst   = internal global [256 x i8] zeroinitializer, align 16
@@ -294,6 +308,82 @@ wcmp.fin:
   %nd.eq = fcmp oeq double %nd.v, 5.000000e-01
   call void @ut_check(i1 %nd.eq, ptr @m.numd)
 
+  ; ---- SIMD structural-scan cross-check: vector path == scalar oracle ----
+  ; fill a 2048-byte buffer with map[rand&15] (structural/ws bytes land inside
+  ; and across 16-byte chunk boundaries), then for EVERY start position assert
+  ; the vector scan_ws / scan_structural equal their scalar oracles. Also sweep
+  ; the adversarial fixed doc (quotes, escapes, CRLF, control, embedded chars).
+  store i64 2463534242, ptr @sc.seed, align 8
+  br label %sc.fill
+sc.fill:
+  %fk = phi i64 [ 0, %wcmp.fin ], [ %fk.n, %sc.fillc ]
+  %fdone = icmp uge i64 %fk, 2048
+  br i1 %fdone, label %sc.chk0, label %sc.fillb
+sc.fillb:
+  %rv = call i64 @ut_rand(ptr @sc.seed)
+  %ridx = and i64 %rv, 15
+  %mp = getelementptr inbounds nuw [16 x i8], ptr @sc.map, i64 0, i64 %ridx
+  %mb = load i8, ptr %mp, align 1
+  %dp = getelementptr inbounds nuw [65536 x i8], ptr @g.json, i64 0, i64 %fk
+  store i8 %mb, ptr %dp, align 1
+  br label %sc.fillc
+sc.fillc:
+  %fk.n = add nuw i64 %fk, 1
+  br label %sc.fill
+sc.chk0:
+  store i64 0, ptr @sc.viol, align 8
+  br label %sc.rloop
+sc.rloop:
+  %ri = phi i64 [ 0, %sc.chk0 ], [ %ri.n, %sc.rcont ]
+  %rdone = icmp ugt i64 %ri, 2048
+  br i1 %rdone, label %sc.aloop.pre, label %sc.rbody
+sc.rbody:
+  %ws.v = call i64 @universe_parse_json_scan_ws(ptr @g.json, i64 2048, i64 %ri)
+  %ws.s = call i64 @universe_parse_json_scan_ws_scalar(ptr @g.json, i64 2048, i64 %ri)
+  %ws.bad = icmp ne i64 %ws.v, %ws.s
+  %st.v = call i64 @universe_parse_json_scan_structural(ptr @g.json, i64 2048, i64 %ri)
+  %st.s = call i64 @universe_parse_json_scan_structural_scalar(ptr @g.json, i64 2048, i64 %ri)
+  %st.bad = icmp ne i64 %st.v, %st.s
+  %r.any = or i1 %ws.bad, %st.bad
+  br i1 %r.any, label %sc.rbad, label %sc.rcont
+sc.rbad:
+  %rv0 = load i64, ptr @sc.viol, align 8
+  %rv1 = add i64 %rv0, 1
+  store i64 %rv1, ptr @sc.viol, align 8
+  br label %sc.rcont
+sc.rcont:
+  %ri.n = add nuw i64 %ri, 1
+  br label %sc.rloop
+sc.aloop.pre:
+  br label %sc.aloop
+sc.aloop:
+  %ai = phi i64 [ 0, %sc.aloop.pre ], [ %ai.n, %sc.acont ]
+  %adone = icmp ugt i64 %ai, 40
+  br i1 %adone, label %sc.fin, label %sc.abody
+sc.abody:
+  %aws.v = call i64 @universe_parse_json_scan_ws(ptr @sc.adv, i64 40, i64 %ai)
+  %aws.s = call i64 @universe_parse_json_scan_ws_scalar(ptr @sc.adv, i64 40, i64 %ai)
+  %aws.bad = icmp ne i64 %aws.v, %aws.s
+  %ast.v = call i64 @universe_parse_json_scan_structural(ptr @sc.adv, i64 40, i64 %ai)
+  %ast.s = call i64 @universe_parse_json_scan_structural_scalar(ptr @sc.adv, i64 40, i64 %ai)
+  %ast.bad = icmp ne i64 %ast.v, %ast.s
+  %a.any = or i1 %aws.bad, %ast.bad
+  br i1 %a.any, label %sc.abad, label %sc.acont
+sc.abad:
+  %av0 = load i64, ptr @sc.viol, align 8
+  %av1 = add i64 %av0, 1
+  store i64 %av1, ptr @sc.viol, align 8
+  br label %sc.acont
+sc.acont:
+  %ai.n = add nuw i64 %ai, 1
+  br label %sc.aloop
+sc.fin:
+  %viol = load i64, ptr @sc.viol, align 8
+  %viol.ok = icmp eq i64 %viol, 0
+  call void @ut_check(i1 %viol.ok, ptr @sc.msg)
+  br label %sc.done
+
+sc.done:
   ; ---- bench ----
   %wb = call i1 @ut_want_bench(i32 %argc, ptr %argv)
   br i1 %wb, label %bench, label %fin
