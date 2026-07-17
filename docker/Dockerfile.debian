@@ -8,14 +8,14 @@
 # Build for the host arch (arm64 on Apple silicon) by default; add
 # `--platform linux/amd64` to exercise x86_64 under emulation.
 
-FROM ubuntu:24.04
+FROM debian:latest
 
 ARG LLVM_VERSION=22
 ENV DEBIAN_FRONTEND=noninteractive
 
 # LLVM from apt.llvm.org (matches the dev host's major version).
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates wget gnupg lsb-release software-properties-common \
+        ca-certificates wget gnupg lsb-release \
         make build-essential \
     && wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh \
     && chmod +x /tmp/llvm.sh \

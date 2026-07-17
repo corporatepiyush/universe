@@ -14,14 +14,23 @@ ifeq ($(UNAME_S),Darwin)
   SHLIB_FLAGS := -dynamiclib -install_name @rpath/libuniverse.dylib
 else
   HOST_ARCH   := $(shell uname -m)
-  HOST_TRIPLE ?= $(HOST_ARCH)-unknown-linux-gnu
+  # Detect the C library so binaries embed the correct dynamic-linker interpreter:
+  # glibc uses /lib/ld-linux-*.so, musl (Alpine) uses /lib/ld-musl-*.so.1. A
+  # hardcoded `-gnu` triple on musl links the glibc loader → the built binary
+  # exec's as "not found" (missing interpreter). Only the Linux runtime gate
+  # (make docker-test-alpine) exposes this; codegen/crosscheck never does.
+  HOST_LIBC   := $(shell [ -e /lib/ld-musl-$(HOST_ARCH).so.1 ] && echo musl || echo gnu)
+  HOST_TRIPLE ?= $(HOST_ARCH)-unknown-linux-$(HOST_LIBC)
   SHLIB       := build/libuniverse.so
   SHLIB_FLAGS := -shared -Wl,-soname,libuniverse.so
 endif
 
 # Host build (test-runnable). IR files carry no triple; the driver supplies it.
 IRFLAGS  := -O3 -target $(HOST_TRIPLE) -Wno-override-module
-LDFLAGS  := -lpthread
+# -lm: modules use libm (fmod/fmodf from float remainder, etc.). macOS folds libm
+# into libSystem (implicit), but Linux/glibc + Alpine/musl require explicit -lm —
+# caught only by the Linux runtime gate (make docker-test), never by macOS/crosscheck.
+LDFLAGS  := -lpthread -lm
 
 # Every module must also codegen for these (objects only, not linked/run).
 CROSS_TRIPLES := x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu \
@@ -59,24 +68,39 @@ DEPS_strings            := simd
 TESTSRC := $(shell find tests -name 'test_*.ll' | sort)
 TESTBIN := $(patsubst tests/%.ll, build/bin/%, $(TESTSRC))
 
-# Docker: run the suite natively on Linux (kernel >= 6.15 enforced in-container).
-DOCKER_IMAGE := universe-linux-test
+# Docker: run the suite natively on Linux (kernel >= 6.15 enforced in-container;
+# set ALLOW_OLD_KERNEL=1 to run on an older VM kernel with a loud warning).
+# Two libc worlds are tested: DISTRO=debian (glibc) and DISTRO=alpine (musl).
+# The container KERNEL comes from the Docker VM, not the image — boot the VM on a
+# >=6.15 guest (e.g. colima with an Ubuntu 25.10 disk image) to satisfy the gate.
+DISTRO ?= debian
+DOCKER_IMAGE := universe-linux-test-$(DISTRO)
 DOCKER_PLATFORM ?=
+ALLOW_OLD_KERNEL ?=
 
 .PHONY: all lib dylib test crosscheck clean list docker-build docker-test \
+        docker-test-debian docker-test-alpine docker-test-all \
         $(addprefix test-,$(DOMAINS)) $(addprefix crosscheck-,$(DOMAINS))
 
 all: lib dylib $(TESTBIN)
 
 docker-build:
 	docker build $(if $(DOCKER_PLATFORM),--platform $(DOCKER_PLATFORM),) \
-	  -t $(DOCKER_IMAGE) -f docker/Dockerfile .
+	  -t $(DOCKER_IMAGE) -f docker/Dockerfile.$(DISTRO) .
 
 # Bind-mounts the source read-only; the container builds into its own tmpfs
 # so the macOS build/ is never touched. `make docker-test` = real Linux run.
 docker-test: docker-build
 	docker run --rm $(if $(DOCKER_PLATFORM),--platform $(DOCKER_PLATFORM),) \
+	  $(if $(ALLOW_OLD_KERNEL),-e ALLOW_OLD_KERNEL=$(ALLOW_OLD_KERNEL),) \
 	  -v "$(CURDIR):/universe:ro" $(DOCKER_IMAGE)
+
+docker-test-debian:
+	@$(MAKE) --no-print-directory docker-test DISTRO=debian
+docker-test-alpine:
+	@$(MAKE) --no-print-directory docker-test DISTRO=alpine
+# Both libc worlds — the mandatory Linux gate.
+docker-test-all: docker-test-debian docker-test-alpine
 
 lib: $(LIB)
 

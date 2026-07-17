@@ -1,0 +1,29 @@
+# Alpine (musl libc) native test image for universe.
+#
+# Purpose: RUN the suite on real Linux with musl libc (NOT glibc), the second
+# mandatory libc world beside docker/Dockerfile.debian. musl differs from glibc
+# in errno handling, malloc, locale, and stack size — so a green run here proves
+# the SDK does not depend on glibc-isms. The container shares the Docker VM
+# kernel; docker/run-tests.sh verifies it is >= 6.15 (boot the VM on a >=6.15
+# guest, e.g. colima with an Ubuntu 25.10 disk image).
+#
+# LLVM/clang 22 is available from the Alpine edge repositories (verified:
+# `clang22`/`llvm22` provide a v22.1 toolchain — required, since the IR uses
+# v22-only dialect). Build for the host arch (arm64) by default.
+
+FROM alpine:edge
+
+# build-base: gcc + musl-dev + binutils + make (crt objects, ld, ar for linking).
+# clang22 assembles the v22 IR; llvm22 + llvm22-dev provide llc/opt/llvm-ar/llvm-as.
+# bash: run-tests.sh needs `set -o pipefail`. lld + compiler-rt: clang linking.
+RUN apk add --no-cache \
+        bash make build-base binutils \
+        clang22 llvm22 llvm22-dev compiler-rt lld
+
+# All LLVM 22 tools (clang, llc, opt, llvm-ar, llvm-as) live here on Alpine.
+ENV LLVM=/usr/lib/llvm22/bin
+WORKDIR /universe
+
+# Source is bind-mounted at run time (see run-tests.sh); build/ stays out of the
+# mount (the script mirrors sources into a container-local build root).
+ENTRYPOINT ["/universe/docker/run-tests.sh"]
