@@ -42,6 +42,22 @@ declare i32 @ut_summary()
 @g.u16 = internal global [65536 x i8] zeroinitializer, align 16
 @g.u8  = internal global [65536 x i8] zeroinitializer, align 16
 
+; ---- SIMD transcode oracle buffers (LE = vector path, BE = scalar-only) ----
+@o.u16le = internal global [65536 x i8] zeroinitializer, align 16
+@o.u16be = internal global [65536 x i8] zeroinitializer, align 16
+@o.b1    = internal global [65536 x i8] zeroinitializer, align 16
+@o.b2    = internal global [65536 x i8] zeroinitializer, align 16
+@o.o1    = internal global [65536 x i8] zeroinitializer, align 16
+@o.o2    = internal global [65536 x i8] zeroinitializer, align 16
+@m2.tnb  = private unnamed_addr constant [22 x i8] c"to_utf8 vec==scl len\00\00"
+@m2.tby  = private unnamed_addr constant [24 x i8] c"to_utf8 vec==scl bytes\00\00"
+@m2.ltu  = private unnamed_addr constant [22 x i8] c"len_to_utf8 == nbytes\00"
+@m2.fvu  = private unnamed_addr constant [22 x i8] c"from_utf8 vec units=U\00"
+@m2.fsu  = private unnamed_addr constant [22 x i8] c"from_utf8 scl units=U\00"
+@m2.fvb  = private unnamed_addr constant [24 x i8] c"from_utf8 vec le bytes\00\00"
+@m2.fsb  = private unnamed_addr constant [24 x i8] c"from_utf8 scl be bytes\00\00"
+@m2.lfu  = private unnamed_addr constant [20 x i8] c"len_from_utf8 == U\00\00"
+
 ; ---- UTF-16 byte buffers for decode (LE and BE) ----
 @d.a.le   = private unnamed_addr constant [2 x i8] c"\41\00", align 1          ; 'A'
 @d.a.be   = private unnamed_addr constant [2 x i8] c"\00\41", align 1
@@ -220,6 +236,7 @@ entry:
   ; ---------------- random scalar round trip ----------------
   ; single deterministic state cell (alloca in entry, never in the loop)
   %scell = alloca i64, align 8
+  %gstate = alloca i64, align 8
   store i64 305419896, ptr %scell, align 8
   br label %rt.head
 
@@ -251,6 +268,85 @@ rt.body:
 
 rt.fin:
   call void @ut_check_eq(i64 %rmism, i64 0, ptr @m.rand)
+
+  ; ---------------- SIMD vector-vs-scalar transcode oracle ----------------
+  ; Build ~2000 units of random VALID scalars (ASCII-biased so >=16-run ASCII
+  ; chunks exercise the vector fast path, mixed with BMP/astral to force the
+  ; scalar handoff). Encode each scalar both LE (into o.u16le) and BE (into
+  ; o.u16be). Then:
+  ;   * to_utf8(LE)   uses the SIMD path; to_utf8(BE) is scalar-only. UTF-8 is
+  ;     endianness-free so the two byte streams MUST be identical -> vector==scalar.
+  ;   * from_utf8(be=0) uses the SIMD path and must reproduce o.u16le exactly;
+  ;     from_utf8(be=1) is scalar-only and must reproduce o.u16be exactly.
+  ;   * len_* helpers must agree with the transcoded sizes.
+  store i64 2862933555777941757, ptr %gstate, align 8
+  br label %vo.gen
+
+vo.gen:
+  %gi = phi i64 [ 0, %rt.fin ], [ %gi.n, %vo.body ]
+  %gdone = icmp uge i64 %gi, 2000
+  br i1 %gdone, label %vo.run, label %vo.body
+
+vo.body:
+  %gr = call i64 @ut_rand(ptr %gstate)
+  %gsel = and i64 %gr, 7
+  %gp = lshr i64 %gr, 3
+  ; ascii candidate 0..127
+  %o.asc = and i64 %gp, 127
+  %o.asc32 = trunc i64 %o.asc to i32
+  ; bmp candidate: [0,0xF800) shifted past the surrogate block
+  %o.bm0 = urem i64 %gp, 63488
+  %o.bm32 = trunc i64 %o.bm0 to i32
+  %o.bsur = icmp uge i32 %o.bm32, 55296
+  %o.bbump = select i1 %o.bsur, i32 2048, i32 0
+  %o.bmp32 = add nuw i32 %o.bm32, %o.bbump
+  ; astral candidate: 0x10000 + [0,0x100000)
+  %o.as0 = urem i64 %gp, 1048576
+  %o.as32 = trunc i64 %o.as0 to i32
+  %o.ast32 = add nuw i32 %o.as32, 65536
+  ; select: sel==7 astral, sel==6 bmp, else ascii
+  %o.isast = icmp eq i64 %gsel, 7
+  %o.isbmp = icmp eq i64 %gsel, 6
+  %o.sca = select i1 %o.isast, i32 %o.ast32, i32 %o.asc32
+  %o.scalar = select i1 %o.isbmp, i32 %o.bmp32, i32 %o.sca
+  %o.boff = shl nuw i64 %gi, 1
+  %o.ple = getelementptr inbounds nuw i8, ptr @o.u16le, i64 %o.boff
+  %o.pbe = getelementptr inbounds nuw i8, ptr @o.u16be, i64 %o.boff
+  %o.uw = call i64 @universe_utf16_encode_scalar(ptr %o.ple, i32 %o.scalar, i32 0)
+  %o.uwb = call i64 @universe_utf16_encode_scalar(ptr %o.pbe, i32 %o.scalar, i32 1)
+  %gi.n = add nuw i64 %gi, %o.uw
+  br label %vo.gen
+
+vo.run:
+  %U = phi i64 [ %gi, %vo.gen ]
+  ; to_utf8: vector (LE) vs scalar (BE); UTF-8 output must be identical bytes
+  %nb_le = call i64 @universe_utf16_to_utf8(ptr @o.b1, i64 65536, ptr @o.u16le, i64 %U, i32 0)
+  %nb_be = call i64 @universe_utf16_to_utf8(ptr @o.b2, i64 65536, ptr @o.u16be, i64 %U, i32 1)
+  %o.nbeq = icmp eq i64 %nb_le, %nb_be
+  call void @ut_check(i1 %o.nbeq, ptr @m2.tnb)
+  %o.mc1 = call i32 @memcmp(ptr @o.b1, ptr @o.b2, i64 %nb_le)
+  %o.mc1z = icmp eq i32 %o.mc1, 0
+  call void @ut_check(i1 %o.mc1z, ptr @m2.tby)
+  %o.ltu = call i64 @universe_utf16_len_to_utf8(ptr @o.u16le, i64 %U, i32 0)
+  %o.ltueq = icmp eq i64 %o.ltu, %nb_le
+  call void @ut_check(i1 %o.ltueq, ptr @m2.ltu)
+  ; from_utf8: vector (be=0) reproduces LE ref; scalar (be=1) reproduces BE ref
+  %un_le = call i64 @universe_utf16_from_utf8(ptr @o.o1, i64 65536, ptr @o.b1, i64 %nb_le, i32 0)
+  %un_be = call i64 @universe_utf16_from_utf8(ptr @o.o2, i64 65536, ptr @o.b1, i64 %nb_le, i32 1)
+  %o.uleq = icmp eq i64 %un_le, %U
+  call void @ut_check(i1 %o.uleq, ptr @m2.fvu)
+  %o.ubeq = icmp eq i64 %un_be, %U
+  call void @ut_check(i1 %o.ubeq, ptr @m2.fsu)
+  %o.ub = shl nuw i64 %U, 1
+  %o.mc2 = call i32 @memcmp(ptr @o.o1, ptr @o.u16le, i64 %o.ub)
+  %o.mc2z = icmp eq i32 %o.mc2, 0
+  call void @ut_check(i1 %o.mc2z, ptr @m2.fvb)
+  %o.mc3 = call i32 @memcmp(ptr @o.o2, ptr @o.u16be, i64 %o.ub)
+  %o.mc3z = icmp eq i32 %o.mc3, 0
+  call void @ut_check(i1 %o.mc3z, ptr @m2.fsb)
+  %o.lfu = call i64 @universe_utf16_len_from_utf8(ptr @o.b1, i64 %nb_le)
+  %o.lfueq = icmp eq i64 %o.lfu, %U
+  call void @ut_check(i1 %o.lfueq, ptr @m2.lfu)
 
   ; ---------------- bench ----------------
   %wb = call i1 @ut_want_bench(i32 %argc, ptr %argv)
