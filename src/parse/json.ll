@@ -29,8 +29,19 @@
 ;     explicit byte stack (0=object, 1=array) so there is NO native call-stack
 ;     recursion to blow — a configurable max-depth bounds the stack.
 ;   * The whitespace skip (@js_skip_ws) and string char-class scan
-;     (@js_scan_string) are the hot leaves: tight countup loops, branch-lean,
-;     no calls on the common byte (hex4 only on a rare '\u').
+;     (@js_scan_string) are the hot leaves. Both are SIMD-first: a 128-bit
+;     <16 x i8> classify loop is the PRIMARY path (lowers to SSE2 pcmpeqb on
+;     AMD64 and NEON cmeq.16b on AArch64, baseline everywhere — no runtime CPU
+;     check). Each 16-byte chunk builds a lane mask with vector `icmp`, folds it
+;     to a 16-bit movemask (`bitcast <16 x i1>`), and `llvm.cttz.i16` LOCATES the
+;     first significant byte — advancing the scanner by whole chunks with no
+;     per-byte branch. The SCALAR path is the sub-16 remainder tail AND the
+;     cross-check oracle: @js_scan_string jumps ordinary runs via
+;     @js_str_find_special (quote/backslash/control classify) then the scalar
+;     code materializes the escape; @js_skip_ws skips whitespace by chunk. The
+;     exported @universe_parse_json_scan_ws / _scan_structural (+ their _scalar
+;     twins) expose the classify primitive and are cross-checked vector==scalar
+;     in the test on random + adversarial input (hex4 only on a rare '\u').
 ;   * A small state machine (7 states) validates grammar: object/array framing,
 ;     key:value pairing, comma separation, no trailing commas, single top value.
 ;   * ERROR CONVENTION: `_next` returns i32 status — 0 OK (token written; a
@@ -61,6 +72,10 @@
 declare ptr @malloc(i64) allockind("alloc,uninitialized") allocsize(0) "alloc-family"="malloc"
 declare void @free(ptr allocptr captures(none)) allockind("free") "alloc-family"="malloc"
 
+; SIMD structural-scan support (simdjson-style 16-byte classify). cttz locates
+; the first matching lane in the 16-bit movemask.
+declare i16 @llvm.cttz.i16(i16, i1)
+
 ; ------------------------------------------------------------- literal tables
 @js.true  = private unnamed_addr constant [4 x i8] c"true", align 1
 @js.false = private unnamed_addr constant [5 x i8] c"false", align 1
@@ -69,16 +84,44 @@ declare void @free(ptr allocptr captures(none)) allockind("free") "alloc-family"
 ; ===================================================================== helpers
 
 ; Skip whitespace (space/tab/LF/CR). Returns index of first non-ws byte (or len).
-; HOT LEAF: tight countup, no calls, branch-lean char class.
+; HOT LEAF, SIMD-first: 128-bit classify chunks skip whole 16-byte runs of
+; whitespace; the scalar tail handles the sub-16 remainder AND is the oracle.
 define internal i64 @js_skip_ws(ptr readonly %buf, i64 %len, i64 %pos) #0 {
 entry:
-  br label %loop
-loop:
-  %i = phi i64 [ %pos, %entry ], [ %i.next, %cont ]
-  %atend = icmp uge i64 %i, %len
+  %end16 = add i64 %pos, 16
+  %has16 = icmp ule i64 %end16, %len
+  br i1 %has16, label %vloop, label %tail.head
+vloop:
+  %i = phi i64 [ %pos, %entry ], [ %i.next, %vcont ]
+  %vp = getelementptr inbounds nuw i8, ptr %buf, i64 %i
+  %v = load <16 x i8>, ptr %vp, align 1
+  %e32 = icmp eq <16 x i8> %v, splat (i8 32)
+  %e9  = icmp eq <16 x i8> %v, splat (i8 9)
+  %e10 = icmp eq <16 x i8> %v, splat (i8 10)
+  %e13 = icmp eq <16 x i8> %v, splat (i8 13)
+  %o1 = or <16 x i1> %e32, %e9
+  %o2 = or <16 x i1> %e10, %e13
+  %ws = or <16 x i1> %o1, %o2
+  %mm = bitcast <16 x i1> %ws to i16
+  %inv = xor i16 %mm, -1
+  %hit = icmp ne i16 %inv, 0
+  br i1 %hit, label %locate, label %vcont
+locate:
+  %tz = call i16 @llvm.cttz.i16(i16 %inv, i1 true)
+  %tz64 = zext i16 %tz to i64
+  %idx = add nuw i64 %i, %tz64
+  ret i64 %idx
+vcont:
+  %i.next = add nuw i64 %i, 16
+  %lim = sub nuw i64 %len, 16
+  %more = icmp ule i64 %i.next, %lim
+  br i1 %more, label %vloop, label %tail.head
+tail.head:
+  %ti = phi i64 [ %pos, %entry ], [ %i.next, %vcont ], [ %ti.next, %cont ]
+  %atend = icmp uge i64 %ti, %len
   br i1 %atend, label %done, label %body
 body:
-  %p = getelementptr inbounds nuw i8, ptr %buf, i64 %i
+  %p = getelementptr inbounds nuw i8, ptr %buf, i64 %ti
   %c = load i8, ptr %p, align 1
   %cz = zext i8 %c to i32
   %sp = icmp eq i32 %cz, 32
@@ -87,13 +130,66 @@ body:
   %cr = icmp eq i32 %cz, 13
   %w1 = or i1 %sp, %tb
   %w2 = or i1 %nl, %cr
-  %ws = or i1 %w1, %w2
-  br i1 %ws, label %cont, label %done
+  %wsc = or i1 %w1, %w2
+  br i1 %wsc, label %cont, label %done
 cont:
-  %i.next = add nuw i64 %i, 1
-  br label %loop
+  %ti.next = add nuw i64 %ti, 1
+  br label %tail.head
 done:
-  ret i64 %i
+  ret i64 %ti
+}
+
+; SIMD classify: first index in [pos,len) whose byte is a JSON string special —
+; a double-quote (34), backslash (92), or control char (< 32) — else len.
+; PRIMARY 128-bit chunk classify; scalar tail for the sub-16 remainder.
+define internal i64 @js_str_find_special(ptr readonly %buf, i64 %len, i64 %pos) #0 {
+entry:
+  %end16 = add i64 %pos, 16
+  %has16 = icmp ule i64 %end16, %len
+  br i1 %has16, label %vloop, label %tail.head
+vloop:
+  %i = phi i64 [ %pos, %entry ], [ %i.next, %vcont ]
+  %vp = getelementptr inbounds nuw i8, ptr %buf, i64 %i
+  %v = load <16 x i8>, ptr %vp, align 1
+  %q = icmp eq <16 x i8> %v, splat (i8 34)
+  %b = icmp eq <16 x i8> %v, splat (i8 92)
+  %ctrl = icmp ult <16 x i8> %v, splat (i8 32)
+  %m1 = or <16 x i1> %q, %b
+  %sm = or <16 x i1> %m1, %ctrl
+  %mm = bitcast <16 x i1> %sm to i16
+  %hit = icmp ne i16 %mm, 0
+  br i1 %hit, label %locate, label %vcont
+locate:
+  %tz = call i16 @llvm.cttz.i16(i16 %mm, i1 true)
+  %tz64 = zext i16 %tz to i64
+  %idx = add nuw i64 %i, %tz64
+  ret i64 %idx
+vcont:
+  %i.next = add nuw i64 %i, 16
+  %lim = sub nuw i64 %len, 16
+  %more = icmp ule i64 %i.next, %lim
+  br i1 %more, label %vloop, label %tail.head
+tail.head:
+  %ti = phi i64 [ %pos, %entry ], [ %i.next, %vcont ], [ %ti.next, %cont ]
+  %atend = icmp uge i64 %ti, %len
+  br i1 %atend, label %miss, label %body
+body:
+  %p = getelementptr inbounds nuw i8, ptr %buf, i64 %ti
+  %c = load i8, ptr %p, align 1
+  %cz = zext i8 %c to i32
+  %isq = icmp eq i32 %cz, 34
+  %isb = icmp eq i32 %cz, 92
+  %isc = icmp ult i32 %cz, 32
+  %s1 = or i1 %isq, %isb
+  %spec = or i1 %s1, %isc
+  br i1 %spec, label %found, label %cont
+cont:
+  %ti.next = add nuw i64 %ti, 1
+  br label %tail.head
+found:
+  ret i64 %ti
+miss:
+  ret i64 %len
 }
 
 ; Parse 4 hex digits at buf[off..off+3]. Returns 0..65535 or -1.
@@ -140,29 +236,26 @@ entry:
   %start1 = add nuw i64 %pos, 1
   br label %loop
 loop:
-  %i = phi i64 [ %start1, %entry ], [ %i.adv, %normal ], [ %i.esc2, %esc.simple ], [ %i.u.res, %resume_u ]
-  %end = icmp uge i64 %i, %len
+  %i = phi i64 [ %start1, %entry ], [ %i.esc2, %esc.simple ], [ %i.u.res, %resume_u ]
+  ; SIMD-first: jump the ordinary-character run to the next special byte (quote,
+  ; backslash, or control) — or len. The scalar code below then materializes it.
+  %sp = call i64 @js_str_find_special(ptr %buf, i64 %len, i64 %i)
+  %end = icmp uge i64 %sp, %len
   br i1 %end, label %fail_at_i, label %rd
 rd:
-  %p = getelementptr inbounds nuw i8, ptr %buf, i64 %i
+  %p = getelementptr inbounds nuw i8, ptr %buf, i64 %sp
   %c = load i8, ptr %p, align 1
   %cz = zext i8 %c to i32
   %isQuote = icmp eq i32 %cz, 34
   br i1 %isQuote, label %close, label %chkesc
 close:
-  %endpos = add nuw i64 %i, 1
+  %endpos = add nuw i64 %sp, 1
   ret i64 %endpos
 chkesc:
   %isBS = icmp eq i32 %cz, 92
-  br i1 %isBS, label %esc, label %chkctrl
-chkctrl:
-  %isCtrl = icmp ult i32 %cz, 32
-  br i1 %isCtrl, label %fail_at_i, label %normal
-normal:
-  %i.adv = add nuw i64 %i, 1
-  br label %loop
+  br i1 %isBS, label %esc, label %fail_at_i
 esc:
-  %j = add nuw i64 %i, 1
+  %j = add nuw i64 %sp, 1
   %jend = icmp uge i64 %j, %len
   br i1 %jend, label %fail_at_i, label %esc.rd
 esc.rd:
@@ -237,7 +330,7 @@ resume_u:
   %i.u.res = phi i64 [ %need, %u.single ], [ %need2, %pair.done ]
   br label %loop
 fail_at_i:
-  %neg.i = sub nsw i64 -1, %i
+  %neg.i = sub nsw i64 -1, %sp
   ret i64 %neg.i
 fail_at_j:
   %neg.j = sub nsw i64 -1, %j
@@ -1253,6 +1346,150 @@ finish:
   %final = select i1 %isMinus, double %neg.res, double %res0
   store double %final, ptr %out, align 8
   ret i32 0
+}
+
+; ============================================ exported SIMD classify primitives
+; These expose the simdjson-style 16-byte structural scan for callers that want
+; to index a document, and are the vector-vs-scalar cross-check surface in the
+; test. scan_ws returns the first non-whitespace index at/after pos (or len);
+; scan_structural returns the first JSON structural byte ({ } [ ] : , ") index
+; at/after pos (or len). Each has a _scalar oracle twin returning bit-identical
+; results.
+
+; VECTOR: first non-whitespace byte index in [pos,len), else len.
+define i64 @universe_parse_json_scan_ws(ptr readonly %buf, i64 %len, i64 %pos) local_unnamed_addr #0 {
+entry:
+  %r = call i64 @js_skip_ws(ptr %buf, i64 %len, i64 %pos)
+  ret i64 %r
+}
+
+; SCALAR ORACLE: first non-whitespace byte index in [pos,len), else len.
+define i64 @universe_parse_json_scan_ws_scalar(ptr readonly %buf, i64 %len, i64 %pos) local_unnamed_addr #0 {
+entry:
+  br label %loop
+loop:
+  %i = phi i64 [ %pos, %entry ], [ %i.next, %cont ]
+  %atend = icmp uge i64 %i, %len
+  br i1 %atend, label %done, label %body
+body:
+  %p = getelementptr inbounds nuw i8, ptr %buf, i64 %i
+  %c = load i8, ptr %p, align 1
+  %cz = zext i8 %c to i32
+  %sp = icmp eq i32 %cz, 32
+  %tb = icmp eq i32 %cz, 9
+  %nl = icmp eq i32 %cz, 10
+  %cr = icmp eq i32 %cz, 13
+  %w1 = or i1 %sp, %tb
+  %w2 = or i1 %nl, %cr
+  %ws = or i1 %w1, %w2
+  br i1 %ws, label %cont, label %done
+cont:
+  %i.next = add nuw i64 %i, 1
+  br label %loop
+done:
+  ret i64 %i
+}
+
+; VECTOR: first JSON structural byte ({ } [ ] : , ") index in [pos,len), else len.
+define i64 @universe_parse_json_scan_structural(ptr readonly %buf, i64 %len, i64 %pos) local_unnamed_addr #0 {
+entry:
+  %end16 = add i64 %pos, 16
+  %has16 = icmp ule i64 %end16, %len
+  br i1 %has16, label %vloop, label %tail.head
+vloop:
+  %i = phi i64 [ %pos, %entry ], [ %i.next, %vcont ]
+  %vp = getelementptr inbounds nuw i8, ptr %buf, i64 %i
+  %v = load <16 x i8>, ptr %vp, align 1
+  %eoc = icmp eq <16 x i8> %v, splat (i8 123)     ; {
+  %ecc = icmp eq <16 x i8> %v, splat (i8 125)     ; }
+  %eob = icmp eq <16 x i8> %v, splat (i8 91)      ; [
+  %ecb = icmp eq <16 x i8> %v, splat (i8 93)      ; ]
+  %eco = icmp eq <16 x i8> %v, splat (i8 58)      ; :
+  %ecm = icmp eq <16 x i8> %v, splat (i8 44)      ; ,
+  %eqt = icmp eq <16 x i8> %v, splat (i8 34)      ; "
+  %o1 = or <16 x i1> %eoc, %ecc
+  %o2 = or <16 x i1> %eob, %ecb
+  %o3 = or <16 x i1> %eco, %ecm
+  %o4 = or <16 x i1> %o1, %o2
+  %o5 = or <16 x i1> %o3, %eqt
+  %sm = or <16 x i1> %o4, %o5
+  %mm = bitcast <16 x i1> %sm to i16
+  %hit = icmp ne i16 %mm, 0
+  br i1 %hit, label %locate, label %vcont
+locate:
+  %tz = call i16 @llvm.cttz.i16(i16 %mm, i1 true)
+  %tz64 = zext i16 %tz to i64
+  %idx = add nuw i64 %i, %tz64
+  ret i64 %idx
+vcont:
+  %i.next = add nuw i64 %i, 16
+  %lim = sub nuw i64 %len, 16
+  %more = icmp ule i64 %i.next, %lim
+  br i1 %more, label %vloop, label %tail.head
+tail.head:
+  %ti = phi i64 [ %pos, %entry ], [ %i.next, %vcont ], [ %ti.next, %cont ]
+  %atend = icmp uge i64 %ti, %len
+  br i1 %atend, label %miss, label %body
+body:
+  %p = getelementptr inbounds nuw i8, ptr %buf, i64 %ti
+  %c = load i8, ptr %p, align 1
+  %cz = zext i8 %c to i32
+  %s.oc = icmp eq i32 %cz, 123
+  %s.cc = icmp eq i32 %cz, 125
+  %s.ob = icmp eq i32 %cz, 91
+  %s.cb = icmp eq i32 %cz, 93
+  %s.co = icmp eq i32 %cz, 58
+  %s.cm = icmp eq i32 %cz, 44
+  %s.qt = icmp eq i32 %cz, 34
+  %t1 = or i1 %s.oc, %s.cc
+  %t2 = or i1 %s.ob, %s.cb
+  %t3 = or i1 %s.co, %s.cm
+  %t4 = or i1 %t1, %t2
+  %t5 = or i1 %t3, %s.qt
+  %spec = or i1 %t4, %t5
+  br i1 %spec, label %found, label %cont
+cont:
+  %ti.next = add nuw i64 %ti, 1
+  br label %tail.head
+found:
+  ret i64 %ti
+miss:
+  ret i64 %len
+}
+
+; SCALAR ORACLE: first JSON structural byte index in [pos,len), else len.
+define i64 @universe_parse_json_scan_structural_scalar(ptr readonly %buf, i64 %len, i64 %pos) local_unnamed_addr #0 {
+entry:
+  br label %loop
+loop:
+  %i = phi i64 [ %pos, %entry ], [ %i.next, %cont ]
+  %atend = icmp uge i64 %i, %len
+  br i1 %atend, label %miss, label %body
+body:
+  %p = getelementptr inbounds nuw i8, ptr %buf, i64 %i
+  %c = load i8, ptr %p, align 1
+  %cz = zext i8 %c to i32
+  %s.oc = icmp eq i32 %cz, 123
+  %s.cc = icmp eq i32 %cz, 125
+  %s.ob = icmp eq i32 %cz, 91
+  %s.cb = icmp eq i32 %cz, 93
+  %s.co = icmp eq i32 %cz, 58
+  %s.cm = icmp eq i32 %cz, 44
+  %s.qt = icmp eq i32 %cz, 34
+  %t1 = or i1 %s.oc, %s.cc
+  %t2 = or i1 %s.ob, %s.cb
+  %t3 = or i1 %s.co, %s.cm
+  %t4 = or i1 %t1, %t2
+  %t5 = or i1 %t3, %s.qt
+  %spec = or i1 %t4, %t5
+  br i1 %spec, label %found, label %cont
+cont:
+  %i.next = add nuw i64 %i, 1
+  br label %loop
+found:
+  ret i64 %i
+miss:
+  ret i64 %len
 }
 
 declare i64 @llvm.umin.i64(i64, i64)

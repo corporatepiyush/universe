@@ -21,6 +21,8 @@ declare void @universe_parse_csv_init(ptr, ptr, i64, i32)
 declare i32  @universe_parse_csv_next_field(ptr, ptr)
 declare i32  @universe_parse_csv_next_record(ptr, ptr, i64, ptr)
 declare i64  @universe_parse_csv_unquote(ptr, ptr, i64)
+declare i64  @universe_parse_csv_scan_field(ptr, i64, i64, i32)
+declare i64  @universe_parse_csv_scan_field_scalar(ptr, i64, i64, i32)
 
 declare i32 @memcmp(ptr, ptr, i64)
 declare i32 @printf(ptr, ...)
@@ -57,6 +59,15 @@ declare i32 @ut_summary()
 @g.dst  = internal global [64 x i8] zeroinitializer, align 16
 @g.rec  = internal global [16 x { i64, i64, i32, i32 }] zeroinitializer, align 16
 @g.csv  = internal global [65536 x i8] zeroinitializer, align 16
+
+; SIMD cross-check byte map: comma, tab, CR, LF, quote and ordinary bytes so
+; delimiter/quote/newline classify bytes land within and across 16-byte chunks.
+@sc.map = private unnamed_addr constant [16 x i8] [ i8 44, i8 9, i8 10, i8 13, i8 34, i8 97, i8 98, i8 99, i8 100, i8 101, i8 49, i8 50, i8 51, i8 120, i8 121, i8 32 ]
+; adversarial fixed doc: quoted comma, doubled quote, CRLF, LF, tab, empties.
+@sc.adv = private unnamed_addr constant [38 x i8] c"ab,\22c,d\22\22e\22,\0D\0Af\09g,,\22h\0Ai\22\0Aj,k\09l,\22\22,mmm\00"
+@sc.msg = private unnamed_addr constant [31 x i8] c"csv simd scan == scalar oracle\00"
+@sc.seed = internal global i64 0, align 8
+@sc.viol = internal global i64 0, align 8
 
 @m.count = private unnamed_addr constant [17 x i8] c"csv field count\0A\00"
 @m.lens  = private unnamed_addr constant [16 x i8] c"csv field lens\0A\00"
@@ -218,6 +229,79 @@ t.done:
   %rr4.eof = icmp eq i32 %rr4, 2
   call void @ut_check(i1 %rr4.eof, ptr @m.receof)
 
+  ; ---- SIMD delimiter-scan cross-check: vector path == scalar oracle ----
+  ; fill a 2048-byte buffer with map[rand&15] (delim/quote/CR/LF land within and
+  ; across 16-byte chunk boundaries), then for EVERY start position and BOTH a
+  ; comma (44) and a tab (9) delimiter assert the vector scan_field equals the
+  ; scalar oracle. Also sweep the adversarial fixed doc (quoted comma, doubled
+  ; quote, CRLF, embedded newline/tab, empty fields).
+  store i64 2463534242, ptr @sc.seed, align 8
+  br label %sc.fill
+sc.fill:
+  %fk = phi i64 [ 0, %t.done ], [ %fk.n, %sc.fillc ]
+  %fdone = icmp uge i64 %fk, 2048
+  br i1 %fdone, label %sc.chk0, label %sc.fillb
+sc.fillb:
+  %rv = call i64 @ut_rand(ptr @sc.seed)
+  %ridx = and i64 %rv, 15
+  %mp = getelementptr inbounds nuw [16 x i8], ptr @sc.map, i64 0, i64 %ridx
+  %mb = load i8, ptr %mp, align 1
+  %dp = getelementptr inbounds nuw [65536 x i8], ptr @g.csv, i64 0, i64 %fk
+  store i8 %mb, ptr %dp, align 1
+  br label %sc.fillc
+sc.fillc:
+  %fk.n = add nuw i64 %fk, 1
+  br label %sc.fill
+sc.chk0:
+  store i64 0, ptr @sc.viol, align 8
+  br label %sc.rloop
+sc.rloop:
+  %ri = phi i64 [ 0, %sc.chk0 ], [ %ri.n, %sc.rcont ]
+  %rdone = icmp ugt i64 %ri, 2048
+  br i1 %rdone, label %sc.aloop.pre, label %sc.rbody
+sc.rbody:
+  %c.v = call i64 @universe_parse_csv_scan_field(ptr @g.csv, i64 2048, i64 %ri, i32 44)
+  %c.s = call i64 @universe_parse_csv_scan_field_scalar(ptr @g.csv, i64 2048, i64 %ri, i32 44)
+  %c.bad = icmp ne i64 %c.v, %c.s
+  %tb.v = call i64 @universe_parse_csv_scan_field(ptr @g.csv, i64 2048, i64 %ri, i32 9)
+  %tb.s = call i64 @universe_parse_csv_scan_field_scalar(ptr @g.csv, i64 2048, i64 %ri, i32 9)
+  %tb.bad = icmp ne i64 %tb.v, %tb.s
+  %r.any = or i1 %c.bad, %tb.bad
+  br i1 %r.any, label %sc.rbad, label %sc.rcont
+sc.rbad:
+  %rv0 = load i64, ptr @sc.viol, align 8
+  %rv1 = add i64 %rv0, 1
+  store i64 %rv1, ptr @sc.viol, align 8
+  br label %sc.rcont
+sc.rcont:
+  %ri.n = add nuw i64 %ri, 1
+  br label %sc.rloop
+sc.aloop.pre:
+  br label %sc.aloop
+sc.aloop:
+  %ai = phi i64 [ 0, %sc.aloop.pre ], [ %ai.n, %sc.acont ]
+  %adone = icmp ugt i64 %ai, 38
+  br i1 %adone, label %sc.fin, label %sc.abody
+sc.abody:
+  %ac.v = call i64 @universe_parse_csv_scan_field(ptr @sc.adv, i64 38, i64 %ai, i32 44)
+  %ac.s = call i64 @universe_parse_csv_scan_field_scalar(ptr @sc.adv, i64 38, i64 %ai, i32 44)
+  %ac.bad = icmp ne i64 %ac.v, %ac.s
+  br i1 %ac.bad, label %sc.abad, label %sc.acont
+sc.abad:
+  %av0 = load i64, ptr @sc.viol, align 8
+  %av1 = add i64 %av0, 1
+  store i64 %av1, ptr @sc.viol, align 8
+  br label %sc.acont
+sc.acont:
+  %ai.n = add nuw i64 %ai, 1
+  br label %sc.aloop
+sc.fin:
+  %viol = load i64, ptr @sc.viol, align 8
+  %viol.ok = icmp eq i64 %viol, 0
+  call void @ut_check(i1 %viol.ok, ptr @sc.msg)
+  br label %sc.done
+
+sc.done:
   ; ---- bench ----
   %wb = call i1 @ut_want_bench(i32 %argc, ptr %argv)
   br i1 %wb, label %bench, label %fin

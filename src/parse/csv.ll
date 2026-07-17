@@ -24,6 +24,15 @@
 ;     buffer once (one big read), then iterate fields at cache speed.
 ;   * One delimiter byte parameterizes CSV (',') vs TSV ('\t') vs anything else;
 ;     no separate code path.
+;   * SIMD-first field scan: both the unquoted-field scan (stop at delim/CR/LF)
+;     and the quoted-content scan (stop at ") are 128-bit <16 x i8> classify
+;     loops as the PRIMARY path (SSE2 pcmpeqb / NEON cmeq.16b — baseline, no
+;     runtime check), advancing by whole 16-byte chunks; a vector `icmp` builds
+;     the lane mask, `bitcast` folds it to a movemask, and `llvm.cttz.i16`
+;     locates the first significant byte. The scalar path handles the sub-16
+;     remainder AND is the cross-check oracle. The exported
+;     @universe_parse_csv_scan_field (+ _scalar twin) exposes the classify
+;     primitive (delim / quote / CR / LF) for indexers and the test.
 ;   * RFC 4180 quoting: a field opening with '"' is a quoted field; a doubled
 ;     quote `""` inside it is a literal quote; commas, CR, LF and the delimiter
 ;     are literal inside quotes (embedded newlines/commas handled). The reported
@@ -51,6 +60,108 @@
 ;   i32  universe_parse_csv_next_field(ptr sc, ptr out_field)   ; 0/1/2/13/8
 ;   i32  universe_parse_csv_next_record(ptr sc, ptr out_arr, i64 cap, ptr out_count)
 ;   i64  universe_parse_csv_unquote(ptr dst, ptr src, i64 len)  ; collapse ""->"
+
+; SIMD structural-scan support: cttz locates the first matching lane in the
+; 16-bit movemask of a 128-bit classify.
+declare i16 @llvm.cttz.i16(i16, i1)
+
+; ---------------------------------------------------------------- SIMD helpers
+; First index in [pos,len) whose byte terminates an UNQUOTED field — the
+; delimiter, LF (10) or CR (13) — else len. PRIMARY 128-bit classify + scalar
+; tail. The delimiter is a runtime byte broadcast across the vector.
+define internal i64 @csv_find_plain(ptr readonly %buf, i64 %len, i64 %pos, i8 %delim) #4 {
+entry:
+  %ins = insertelement <16 x i8> poison, i8 %delim, i64 0
+  %dv = shufflevector <16 x i8> %ins, <16 x i8> poison, <16 x i32> zeroinitializer
+  %end16 = add i64 %pos, 16
+  %has16 = icmp ule i64 %end16, %len
+  br i1 %has16, label %vloop, label %tail.head
+vloop:
+  %i = phi i64 [ %pos, %entry ], [ %i.next, %vcont ]
+  %vp = getelementptr inbounds nuw i8, ptr %buf, i64 %i
+  %v = load <16 x i8>, ptr %vp, align 1
+  %ed = icmp eq <16 x i8> %v, %dv
+  %e10 = icmp eq <16 x i8> %v, splat (i8 10)
+  %e13 = icmp eq <16 x i8> %v, splat (i8 13)
+  %o1 = or <16 x i1> %ed, %e10
+  %sm = or <16 x i1> %o1, %e13
+  %mm = bitcast <16 x i1> %sm to i16
+  %hit = icmp ne i16 %mm, 0
+  br i1 %hit, label %locate, label %vcont
+locate:
+  %tz = call i16 @llvm.cttz.i16(i16 %mm, i1 true)
+  %tz64 = zext i16 %tz to i64
+  %idx = add nuw i64 %i, %tz64
+  ret i64 %idx
+vcont:
+  %i.next = add nuw i64 %i, 16
+  %lim = sub nuw i64 %len, 16
+  %more = icmp ule i64 %i.next, %lim
+  br i1 %more, label %vloop, label %tail.head
+tail.head:
+  %ti = phi i64 [ %pos, %entry ], [ %i.next, %vcont ], [ %ti.next, %cont ]
+  %atend = icmp uge i64 %ti, %len
+  br i1 %atend, label %miss, label %body
+body:
+  %p = getelementptr inbounds nuw i8, ptr %buf, i64 %ti
+  %c = load i8, ptr %p, align 1
+  %isd = icmp eq i8 %c, %delim
+  %islf = icmp eq i8 %c, 10
+  %iscr = icmp eq i8 %c, 13
+  %t1 = or i1 %isd, %islf
+  %term = or i1 %t1, %iscr
+  br i1 %term, label %found, label %cont
+cont:
+  %ti.next = add nuw i64 %ti, 1
+  br label %tail.head
+found:
+  ret i64 %ti
+miss:
+  ret i64 %len
+}
+
+; First index in [pos,len) whose byte is a double-quote (34) — else len.
+; PRIMARY 128-bit classify + scalar tail.
+define internal i64 @csv_find_quote(ptr readonly %buf, i64 %len, i64 %pos) #4 {
+entry:
+  %end16 = add i64 %pos, 16
+  %has16 = icmp ule i64 %end16, %len
+  br i1 %has16, label %vloop, label %tail.head
+vloop:
+  %i = phi i64 [ %pos, %entry ], [ %i.next, %vcont ]
+  %vp = getelementptr inbounds nuw i8, ptr %buf, i64 %i
+  %v = load <16 x i8>, ptr %vp, align 1
+  %eq = icmp eq <16 x i8> %v, splat (i8 34)
+  %mm = bitcast <16 x i1> %eq to i16
+  %hit = icmp ne i16 %mm, 0
+  br i1 %hit, label %locate, label %vcont
+locate:
+  %tz = call i16 @llvm.cttz.i16(i16 %mm, i1 true)
+  %tz64 = zext i16 %tz to i64
+  %idx = add nuw i64 %i, %tz64
+  ret i64 %idx
+vcont:
+  %i.next = add nuw i64 %i, 16
+  %lim = sub nuw i64 %len, 16
+  %more = icmp ule i64 %i.next, %lim
+  br i1 %more, label %vloop, label %tail.head
+tail.head:
+  %ti = phi i64 [ %pos, %entry ], [ %i.next, %vcont ], [ %ti.next, %cont ]
+  %atend = icmp uge i64 %ti, %len
+  br i1 %atend, label %miss, label %body
+body:
+  %p = getelementptr inbounds nuw i8, ptr %buf, i64 %ti
+  %c = load i8, ptr %p, align 1
+  %isq = icmp eq i8 %c, 34
+  br i1 %isq, label %found, label %cont
+cont:
+  %ti.next = add nuw i64 %ti, 1
+  br label %tail.head
+found:
+  ret i64 %ti
+miss:
+  ret i64 %len
+}
 
 ; ------------------------------------------------------------------------ init
 define void @universe_parse_csv_init(ptr %sc, ptr %buf, i64 %len, i32 %delim) local_unnamed_addr #0 {
@@ -94,24 +205,10 @@ start:
   br i1 %isQuote, label %quoted, label %plain
 
 ; ---- unquoted field: scan to delimiter / CR / LF / EOF ----
+; SIMD-first: the 128-bit classify jumps whole 16-byte runs to the terminator.
 plain:
-  br label %plain.head
-plain.head:
-  %pi = phi i64 [ %pos, %plain ], [ %pi.next, %plain.cont ]
-  %pi.end = icmp uge i64 %pi, %len
-  br i1 %pi.end, label %plain.term, label %plain.rd
-plain.rd:
-  %pip = getelementptr inbounds nuw i8, ptr %buf, i64 %pi
-  %pic = load i8, ptr %pip, align 1
-  %is.delim = icmp eq i8 %pic, %delim
-  %is.lf = icmp eq i8 %pic, 10
-  %is.cr = icmp eq i8 %pic, 13
-  %t1 = or i1 %is.delim, %is.lf
-  %is.term = or i1 %t1, %is.cr
-  br i1 %is.term, label %plain.term, label %plain.cont
-plain.cont:
-  %pi.next = add nuw i64 %pi, 1
-  br label %plain.head
+  %pi = call i64 @csv_find_plain(ptr %buf, i64 %len, i64 %pos, i8 %delim)
+  br label %plain.term
 plain.term:
   %plain.flen = sub i64 %pi, %pos
   call void @csv_write(ptr %out, i64 %pos, i64 %plain.flen, i32 0)
@@ -119,21 +216,16 @@ plain.term:
   ret i32 %pr
 
 ; ---- quoted field: content between the outer quotes, "" is a literal quote ----
+; SIMD-first: the 128-bit classify jumps whole 16-byte runs to the next quote;
+; the scalar code then resolves doubled-quote ("") vs field close.
 quoted:
   %qstart = add nuw i64 %pos, 1
   br label %q.head
 q.head:
-  %qi = phi i64 [ %qstart, %quoted ], [ %qi.n1, %q.plain ], [ %qi.n2, %q.dbl ]
+  %qs = phi i64 [ %qstart, %quoted ], [ %qi.n2, %q.dbl ]
+  %qi = call i64 @csv_find_quote(ptr %buf, i64 %len, i64 %qs)
   %qi.end = icmp uge i64 %qi, %len
-  br i1 %qi.end, label %q.unterm, label %q.rd
-q.rd:
-  %qip = getelementptr inbounds nuw i8, ptr %buf, i64 %qi
-  %qic = load i8, ptr %qip, align 1
-  %qq = icmp eq i8 %qic, 34
-  br i1 %qq, label %q.quote, label %q.plain
-q.plain:
-  %qi.n1 = add nuw i64 %qi, 1
-  br label %q.head
+  br i1 %qi.end, label %q.unterm, label %q.quote
 q.quote:
   ; a quote inside: doubled ("") => literal, else it closes the field
   %qj = add nuw i64 %qi, 1
@@ -342,7 +434,99 @@ dbl:
   br label %loop
 }
 
+; ============================================ exported SIMD classify primitive
+; First index in [pos,len) whose byte is CSV-significant — the delimiter, a
+; double-quote (34), CR (13) or LF (10) — else len. Exposes the classify scan
+; for indexers and is the vector-vs-scalar cross-check surface in the test.
+
+; VECTOR primary.
+define i64 @universe_parse_csv_scan_field(ptr readonly %buf, i64 %len, i64 %pos, i32 %delim) local_unnamed_addr #4 {
+entry:
+  %db = trunc i32 %delim to i8
+  %ins = insertelement <16 x i8> poison, i8 %db, i64 0
+  %dv = shufflevector <16 x i8> %ins, <16 x i8> poison, <16 x i32> zeroinitializer
+  %end16 = add i64 %pos, 16
+  %has16 = icmp ule i64 %end16, %len
+  br i1 %has16, label %vloop, label %tail.head
+vloop:
+  %i = phi i64 [ %pos, %entry ], [ %i.next, %vcont ]
+  %vp = getelementptr inbounds nuw i8, ptr %buf, i64 %i
+  %v = load <16 x i8>, ptr %vp, align 1
+  %ed = icmp eq <16 x i8> %v, %dv
+  %eqt = icmp eq <16 x i8> %v, splat (i8 34)
+  %e10 = icmp eq <16 x i8> %v, splat (i8 10)
+  %e13 = icmp eq <16 x i8> %v, splat (i8 13)
+  %o1 = or <16 x i1> %ed, %eqt
+  %o2 = or <16 x i1> %e10, %e13
+  %sm = or <16 x i1> %o1, %o2
+  %mm = bitcast <16 x i1> %sm to i16
+  %hit = icmp ne i16 %mm, 0
+  br i1 %hit, label %locate, label %vcont
+locate:
+  %tz = call i16 @llvm.cttz.i16(i16 %mm, i1 true)
+  %tz64 = zext i16 %tz to i64
+  %idx = add nuw i64 %i, %tz64
+  ret i64 %idx
+vcont:
+  %i.next = add nuw i64 %i, 16
+  %lim = sub nuw i64 %len, 16
+  %more = icmp ule i64 %i.next, %lim
+  br i1 %more, label %vloop, label %tail.head
+tail.head:
+  %ti = phi i64 [ %pos, %entry ], [ %i.next, %vcont ], [ %ti.next, %cont ]
+  %atend = icmp uge i64 %ti, %len
+  br i1 %atend, label %miss, label %body
+body:
+  %p = getelementptr inbounds nuw i8, ptr %buf, i64 %ti
+  %c = load i8, ptr %p, align 1
+  %isd = icmp eq i8 %c, %db
+  %isq = icmp eq i8 %c, 34
+  %islf = icmp eq i8 %c, 10
+  %iscr = icmp eq i8 %c, 13
+  %t1 = or i1 %isd, %isq
+  %t2 = or i1 %islf, %iscr
+  %term = or i1 %t1, %t2
+  br i1 %term, label %found, label %cont
+cont:
+  %ti.next = add nuw i64 %ti, 1
+  br label %tail.head
+found:
+  ret i64 %ti
+miss:
+  ret i64 %len
+}
+
+; SCALAR ORACLE: bit-identical twin of universe_parse_csv_scan_field.
+define i64 @universe_parse_csv_scan_field_scalar(ptr readonly %buf, i64 %len, i64 %pos, i32 %delim) local_unnamed_addr #4 {
+entry:
+  %db = trunc i32 %delim to i8
+  br label %loop
+loop:
+  %i = phi i64 [ %pos, %entry ], [ %i.next, %cont ]
+  %atend = icmp uge i64 %i, %len
+  br i1 %atend, label %miss, label %body
+body:
+  %p = getelementptr inbounds nuw i8, ptr %buf, i64 %i
+  %c = load i8, ptr %p, align 1
+  %isd = icmp eq i8 %c, %db
+  %isq = icmp eq i8 %c, 34
+  %islf = icmp eq i8 %c, 10
+  %iscr = icmp eq i8 %c, 13
+  %t1 = or i1 %isd, %isq
+  %t2 = or i1 %islf, %iscr
+  %term = or i1 %t1, %t2
+  br i1 %term, label %found, label %cont
+cont:
+  %i.next = add nuw i64 %i, 1
+  br label %loop
+found:
+  ret i64 %i
+miss:
+  ret i64 %len
+}
+
 attributes #0 = { nounwind willreturn norecurse nosync nofree memory(argmem: readwrite) }
 attributes #1 = { nounwind willreturn norecurse nosync nofree memory(argmem: readwrite) }
 attributes #2 = { nounwind willreturn norecurse nosync nofree memory(argmem: write) }
 attributes #3 = { nounwind willreturn norecurse nosync nofree memory(argmem: readwrite) }
+attributes #4 = { nounwind willreturn norecurse nosync nofree memory(argmem: read) }
